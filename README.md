@@ -153,6 +153,50 @@ the results JSON) are traced too. Commands that produce nothing are shown as
 `(not created)`, which is what a failed compile or a timed-out simulation looks
 like.
 
+## Desktop GUI
+
+`gui/` is a desktop front-end (Rust, [iced](https://iced.rs)) for everything
+above: import ONNX models, run ops on a chosen set of cores and compare them,
+define a sweep's parameter space and run it over a group of models such as
+MNIST and KWS, and read the results. It runs on Linux, macOS and Windows.
+
+```bash
+cd gui && cargo run --release
+```
+
+It is a thin client: it runs the same scripts you would (`make_op.py`,
+`run.py`, `run_hetero.py`, `sweep/run.py`, `sweep/report.py`, plus
+`pipeline/gui_query.py`, which answers its questions about ops and knobs as
+JSON) and draws what they write. Where they run is a setting:
+
+- **Docker** (any OS; the only choice on macOS and Windows, since GVSoC builds
+  on Linux only). Each job is a `docker run` of the `hetero-sim` image with the
+  workspace's `ops/`, `results/` and `work/` mounted, so the workspace can be a
+  plain clone with no `setup.sh`. Build the image first (see
+  [Docker](#docker)); an image older than the GUI helpers is caught by
+  *Settings → Check environment*. Output is chowned back to you on Linux.
+- **Native**: a Linux checkout where `./setup.sh` has run.
+
+The tabs:
+
+| tab | what it does |
+|-----|--------------|
+| Models & ops | list `ops/` (and Deeploy's kernel tests), inspect a graph's inputs, outputs and node types, import an `.onnx` with an `inputs.npz` or random inputs, regenerate `ops/mnist` and `ops/kws` |
+| Compare cores | run ops on any of cva6 / snitch / spatz / ara standalone (`run.py`), or on the SoC mapped or pinned (`run_hetero.py`); bar charts, speedups, cache counters, node mapping |
+| Sweep | pick models, host and samples; set the parameter space as one-factor-at-a-time, full factorial or an explicit list of points; check the points against `design.py` before launching; save/load the spec |
+| Sweep results | live progress, the sensitivity table and Pareto front from `report.py`, every cell, CSV export |
+| Jobs | the queue, live logs, cancel, and the exact command of each job |
+
+GUI output goes under `work/gui/` (runs, sweeps), never over the committed
+`results/`. The flags it relies on are ordinary CLI flags, usable by hand:
+`run.py --out FILE`, `sweep/run.py --designs FILE --progress json`, and
+`sweep/report.py --json`.
+
+`cargo test` covers parsing, the space expansion and command building; the
+tests that drive the pipeline through Docker are opt-in:
+`cargo test -- --ignored --test-threads=1` (image from `HETERO_GUI_TEST_IMAGE`,
+default `hetero-sim:gui`). CI builds and tests the GUI on all three platforms.
+
 ## Results
 
 Cycles for the timed op, one core of each type, on the default modelled-memory
@@ -409,6 +453,9 @@ The Ara model computed wrong answers until five fixes, listed under
 setup.sh               fetch + patch + build all dependencies (pinned commits)
 pipeline/run.py        the pipeline driver (codegen → build → simulate → report)
 pipeline/make_op.py    wrap an ONNX model + inputs into a pipeline op directory
+pipeline/sweep/        design-space sweeps: design rules, area model, driver, report
+pipeline/gui_query.py  ops, knobs, graph inspection and design checks as JSON (for the GUI)
+gui/                   the desktop front-end (Rust + iced), see "Desktop GUI"
 runtime/               bare-metal glue: crt0, semihosting, linker scripts, bench main
 runtime/snitch/snitch_ssr.h    Xssr/Xfrep intrinsics as raw instruction encodings
 runtime/snitch/kernels/        the FP kernels Snitch overrides (MatMul/GEMM/Conv2d/MFCC)

@@ -76,50 +76,41 @@ def pareto(points):
     return out
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("jsonl")
-    args = ap.parse_args()
-    rows = load(args.jsonl)
+def analyse(rows):
+    """Everything the report says, as data.
 
+    The text report below prints from this and `--json` dumps it, so a program
+    reading a sweep (the GUI) and a person reading it see the same numbers.
+    """
     ok = [r for r in rows if r["status"] == "ok"]
     other = [r for r in rows if r["status"] != "ok"]
-    print(f"{len(rows)} cells: {len(ok)} ok, {len(other)} not\n")
-    for r in other:
-        why = "; ".join(r.get("reasons", []))[:120]
-        print(f"  {r['status']:10} {r['design_slug'][:36]:36} {r['model']:8} {why}")
-    if other:
-        print()
+    out = {
+        "cells": len(rows), "ok": len(ok),
+        "not_ok": [{"status": r["status"], "design_slug": r["design_slug"],
+                    "model": r["model"], "reasons": r.get("reasons", [])}
+                   for r in other],
+        "sensitivity": [],
+        "pareto": None,
+        "robustness": None,
+    }
 
     for model in sorted({r["model"] for r in ok}):
         base, eff, base_design = sensitivity(rows, model)
         if base is None:
             continue
-        print(f"=== {model}: sensitivity (baseline {base:,} cycles) ===\n")
-        # Base cycles repeat down the column, but keeping them on the row makes
-        # a line self-contained: grepped, pasted or compared across models, it
-        # still says what it was measured against.
-        print(f"  {'knob':20} {'base':>10} {'value':>10} "
-              f"{'base cycles':>13} {'cycles':>12} {'vs base':>9}")
-        for knob, pts in eff:
-            was = base_design.get(knob, "?")
-            for value, c, pct in sorted(pts):
-                print(f"  {knob:20} {was:>10} {value:>10} "
-                      f"{base:>13,} {c:>12,} {pct:>+8.1f}%")
+        knobs = [{"knob": knob, "base_value": base_design.get(knob, "?"),
+                  "points": [{"value": v, "cycles": c, "pct": pct}
+                             for v, c, pct in sorted(pts)]}
+                 for knob, pts in eff]
         flat = [k for k, pts in eff if all(abs(p[2]) < 0.05 for p in pts)]
-        if flat:
-            print(f"\n  No measurable effect: {', '.join(flat)}")
-            print("  (A host vector knob does nothing on the scalar host -- those "
-                  "need --host ara.)")
-        print()
+        out["sensitivity"].append({"model": model, "base_cycles": base,
+                                   "knobs": knobs, "flat": flat})
 
     # --- Pareto -------------------------------------------------------------
     have_area = [r for r in ok if r.get("area_au")]
     have_energy = [r for r in have_area if r.get("cache_dynamic_pj")]
     if not have_area:
-        print("No area figures in these rows; skipping the Pareto pass.")
-        return
+        return out
 
     sourced = all(r.get("area_coefficients_sourced") for r in have_area)
     objectives = ("cycles", "area")
@@ -133,18 +124,18 @@ def main():
         objectives = ("cycles", "area", "energy")
 
     front = pareto(pts)
-    print(f"=== Pareto front over {', '.join(objectives)} "
-          f"({len(front)} of {len(pts)} non-dominated) ===\n")
-    for key, obj in sorted(front, key=lambda kv: kv[1][0]):
-        vals = "  ".join(f"{o:,.0f}" for o in obj)
-        print(f"  {key[:46]:46} {vals}")
+    out["pareto"] = {
+        "objectives": list(objectives),
+        "points": len(pts),
+        "front": [{"key": key, "objectives": obj}
+                  for key, obj in sorted(front, key=lambda kv: kv[1][0])],
+    }
 
     # --- Robustness ---------------------------------------------------------
-    print(f"\n=== Robustness: area coefficients +/-{int(PERTURB*100)}% ===\n")
+    rob = {"perturb": PERTURB, "sourced": sourced}
+    out["robustness"] = rob
     if sourced:
-        print("  All area coefficients are sourced; the front above stands on "
-              "measured figures.")
-        return
+        return out
     # Scale the SRAM-heavy and logic-heavy halves in opposite directions: that
     # is the perturbation the front is most exposed to, because it changes the
     # balance between "more cache" and "more compute" rather than the total.
@@ -162,13 +153,76 @@ def main():
             moved.append((f"{r['design_slug']}|{r['model']}", obj))
         stable &= set(k for k, _ in pareto(moved))
 
-    lost = sorted(set(k for k, _ in front) - stable)
-    print(f"  {len(stable)} of {len(front)} front members survive both perturbations.")
-    if lost:
+    rob["front"] = len(front)
+    rob["stable"] = sorted(stable)
+    rob["lost"] = sorted(set(k for k, _ in front) - stable)
+    return out
+
+
+def print_report(a):
+    print(f"{a['cells']} cells: {a['ok']} ok, {len(a['not_ok'])} not\n")
+    for r in a["not_ok"]:
+        why = "; ".join(r["reasons"])[:120]
+        print(f"  {r['status']:10} {r['design_slug'][:36]:36} {r['model']:8} {why}")
+    if a["not_ok"]:
+        print()
+
+    for s in a["sensitivity"]:
+        base = s["base_cycles"]
+        print(f"=== {s['model']}: sensitivity (baseline {base:,} cycles) ===\n")
+        # Base cycles repeat down the column, but keeping them on the row makes
+        # a line self-contained: grepped, pasted or compared across models, it
+        # still says what it was measured against.
+        print(f"  {'knob':20} {'base':>10} {'value':>10} "
+              f"{'base cycles':>13} {'cycles':>12} {'vs base':>9}")
+        for k in s["knobs"]:
+            for p in k["points"]:
+                print(f"  {k['knob']:20} {k['base_value']:>10} {p['value']:>10} "
+                      f"{base:>13,} {p['cycles']:>12,} {p['pct']:>+8.1f}%")
+        if s["flat"]:
+            print(f"\n  No measurable effect: {', '.join(s['flat'])}")
+            print("  (A host vector knob does nothing on the scalar host -- those "
+                  "need --host ara.)")
+        print()
+
+    # --- Pareto -------------------------------------------------------------
+    if a["pareto"] is None:
+        print("No area figures in these rows; skipping the Pareto pass.")
+        return
+    p = a["pareto"]
+    print(f"=== Pareto front over {', '.join(p['objectives'])} "
+          f"({len(p['front'])} of {p['points']} non-dominated) ===\n")
+    for f in p["front"]:
+        vals = "  ".join(f"{o:,.0f}" for o in f["objectives"])
+        print(f"  {f['key'][:46]:46} {vals}")
+
+    # --- Robustness ---------------------------------------------------------
+    rob = a["robustness"]
+    print(f"\n=== Robustness: area coefficients +/-{int(rob['perturb']*100)}% ===\n")
+    if rob["sourced"]:
+        print("  All area coefficients are sourced; the front above stands on "
+              "measured figures.")
+        return
+    print(f"  {len(rob['stable'])} of {rob['front']} front members survive both perturbations.")
+    if rob["lost"]:
         print("  Depend on the placeholder coefficients: "
-              + ", ".join(k[:40] for k in lost))
+              + ", ".join(k[:40] for k in rob["lost"]))
     print("\n  Area coefficients are PLACEHOLDERS (see pipeline/sweep/area.py).")
     print("  Treat the cycles column as the only measured objective here.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("jsonl")
+    ap.add_argument("--json", action="store_true",
+                    help="print the analysis as one JSON object instead of text")
+    args = ap.parse_args()
+    a = analyse(load(args.jsonl))
+    if args.json:
+        print(json.dumps(a, indent=2))
+    else:
+        print_report(a)
 
 
 if __name__ == "__main__":

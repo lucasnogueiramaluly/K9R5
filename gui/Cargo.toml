@@ -1,0 +1,23 @@
+[package]
+name = "hetero-gui"
+version = "0.1.0"
+edition = "2024"
+description = "Desktop front-end for the hetero-sim CVA6/Snitch/Spatz simulation pipeline"
+license = "MIT"
+publish = false
+
+[dependencies]
+iced = { version = "0.14", features = ["tokio", "canvas"] }
+tokio = { version = "1", features = ["process", "io-util", "rt", "rt-multi-thread", "time", "fs", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+rfd = { version = "0.15", default-features = false, features = ["tokio", "xdg-portal"] }
+directories = "6"
+anyhow = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+strip = true
