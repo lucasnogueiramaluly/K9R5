@@ -17,3 +17,6 @@ __pycache__/
 
 # MNIST download cache, re-fetched by pipeline/mnist.py
 /ops/mnist/mnist.npz
+
+# GUI build output
+/gui/target/
