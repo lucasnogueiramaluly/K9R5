@@ -288,7 +288,7 @@ def simulate(core: Core, memory: str, elf: Path, run_dir: Path, timeout_s: int):
 
 
 def report(op_name: str, memory: str, results: list[dict],
-           spatz_kernels: str = "tuned") -> None:
+           spatz_kernels: str = "tuned", out_path=None) -> None:
     ok = {r["core"]: r for r in results if "cycles" in r}
     base = ok.get("cva6")
 
@@ -322,15 +322,25 @@ def report(op_name: str, memory: str, results: list[dict],
                       f"{rate:>9} {c['latency_cycles']:>10}")
         print()
 
-    RESULTS.mkdir(exist_ok=True)
-    suffix = "" if memory == DEFAULT_MEMORY else f"-{memory}"
-    suffix += "" if spatz_kernels == "tuned" else f"-spatz-{spatz_kernels}"
-    out = RESULTS / f"{op_name.replace('/', '_')}{suffix}.json"
+    if out_path is not None:
+        # Somewhere of the caller's choosing -- a GUI run, or a --cores subset
+        # that must not overwrite the committed all-cores results/<op>.json.
+        out = Path(out_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        RESULTS.mkdir(exist_ok=True)
+        suffix = "" if memory == DEFAULT_MEMORY else f"-{memory}"
+        suffix += "" if spatz_kernels == "tuned" else f"-spatz-{spatz_kernels}"
+        out = RESULTS / f"{op_name.replace('/', '_')}{suffix}.json"
     out.write_text(json.dumps({"op": op_name, "memory": memory,
                                "spatz_kernels": spatz_kernels,
                                "results": results}, indent=2))
     note_file(out, "per-core metrics")
-    print(f"results written to {out.relative_to(ROOT)}")
+    try:
+        shown = out.resolve().relative_to(ROOT)
+    except ValueError:
+        shown = out
+    print(f"results written to {shown}")
 
 
 def main():
@@ -345,6 +355,8 @@ def main():
                          "in runtime/spatz/kernels (default), or autovectorized "
                          "from the Deeploy Generic sources")
     ap.add_argument("--timeout", type=int, default=600, help="per-sim timeout [s]")
+    ap.add_argument("--out", default=None,
+                    help="write the result JSON here instead of results/")
     ap.add_argument("-d", "--debug", action="store_true",
                     help="trace every command run and the files it generated (on stderr)")
     args = ap.parse_args()
@@ -386,7 +398,7 @@ def main():
         results.append(simulate(core, args.memory, elf,
                                 work / cname / f"run-{args.memory}", args.timeout))
 
-    report(op_name, args.memory, results, args.spatz_kernels)
+    report(op_name, args.memory, results, args.spatz_kernels, out_path=args.out)
 
 
 if __name__ == "__main__":

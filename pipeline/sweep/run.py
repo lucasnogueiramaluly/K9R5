@@ -101,7 +101,44 @@ def parse_knob(spec: str):
     return knob, out
 
 
-def expand(grid_name: str, knobs=None):
+def load_designs(path):
+    """An explicit list of design points, from a JSON file.
+
+    Each entry is a partial design -- the knobs it moves -- exactly as --knob
+    would build it, so a caller that wants a factorial grid or a hand-picked set
+    (the GUI does both) writes the points out and the rest of the sweep does not
+    know the difference. Unknown knobs are refused here, before any cell runs,
+    for the same reason parse_knob refuses them.
+    """
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--designs {path}: {exc}")
+    if not isinstance(data, list) or not all(isinstance(d, dict) for d in data):
+        raise SystemExit(f"--designs {path}: want a JSON list of objects, "
+                         "each mapping knob names to integers")
+    out = []
+    for i, d in enumerate(data):
+        design = {}
+        for knob, value in d.items():
+            name = knob.strip().upper()
+            if name not in design_mod.DEFAULTS:
+                near = difflib.get_close_matches(name, design_mod.DEFAULTS, n=3, cutoff=0.6)
+                hint = f" Did you mean {', '.join(near)}?" if near else ""
+                raise SystemExit(f"--designs {path}: entry {i}: unknown knob {knob!r}.{hint}")
+            if isinstance(value, str):
+                try:
+                    value = int(value, 0)
+                except ValueError:
+                    value = None
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise SystemExit(f"--designs {path}: entry {i}: {knob} is not an integer")
+            design[name] = value
+        out.append(design)
+    return out
+
+
+def expand(grid_name: str, knobs=None, explicit=None):
     """The design points to run, baseline first.
 
     The baseline is always included, and always first: every number the report
@@ -109,7 +146,9 @@ def expand(grid_name: str, knobs=None):
     against.
     """
     designs = [{}]
-    if knobs:
+    if explicit is not None:
+        designs.extend(explicit)
+    elif knobs:
         for knob, values in knobs:
             for v in values:
                 designs.append({knob: v})
@@ -158,10 +197,18 @@ class Progress:
         self.durations = []
         self.cell = ""
         self.phase = ""
+        # json: one event object per line, for a program reading the sweep
+        # (the GUI) rather than a person.
+        self.json = mode == "json"
         if mode == "auto":
             self.bar = sys.stdout.isatty()
         else:
             self.bar = mode == "bar"
+        self._emit({"event": "start", "total": total})
+
+    def _emit(self, event: dict) -> None:
+        if self.json:
+            print(json.dumps(event), flush=True)
 
     @staticmethod
     def _clock(seconds) -> str:
@@ -180,16 +227,24 @@ class Progress:
     def start(self, cell: str) -> None:
         self.cell = cell
         self.phase = "starting"
+        self._emit({"event": "cell", "index": self.done, "cell": cell})
         self._render()
 
     def step(self, phase: str) -> None:
         self.phase = phase
+        self._emit({"event": "phase", "index": self.done, "phase": phase})
         self._render()
 
     def finish(self, row: dict) -> None:
         self.done += 1
         if row.get("wall_s"):
             self.durations.append(row["wall_s"])
+        if self.json:
+            eta = self._eta()
+            self._emit({"event": "row", "done": self.done, "total": self.total,
+                        "eta_s": round(eta, 1) if eta is not None else None,
+                        "row": row})
+            return
         if not self.bar:
             cyc = (row.get("cycles_per_image") or row.get("cycles_per_clip")
                    or row.get("cycles"))
@@ -225,6 +280,8 @@ class Progress:
         sys.stdout.flush()
 
     def done_all(self) -> None:
+        self._emit({"event": "done", "done": self.done, "total": self.total,
+                    "wall_s": round(time.time() - self.t0, 1)})
         self._clear()
 
 
@@ -377,6 +434,12 @@ def main():
     ap.add_argument("--models", nargs="+", required=True, help="op directories")
     ap.add_argument("--grid", default="ofat",
                     help="named grid to run when no --knob is given (default: %(default)s)")
+    ap.add_argument("--designs", default=None, metavar="FILE",
+                    help="run exactly these design points: a JSON list of "
+                         "objects mapping knobs to values, e.g. "
+                         "[{\"SPATZ_NB_LANES\": 8, \"SPATZ_NB_CORE\": 17}]. "
+                         "Use it for factorial or hand-picked grids. The "
+                         "baseline is still prepended. Excludes --knob/--grid.")
     ap.add_argument("--knob", action="append", default=[], metavar="KNOB=v1,v2",
                     help="sweep just this knob over these values, instead of the "
                          "named grid. Repeatable. The baseline is always included, "
@@ -393,10 +456,18 @@ def main():
                          "which is the comparison that shows what the overlap buys")
     ap.add_argument("--images", default="16", help="samples per model run")
     ap.add_argument("--limit", type=int, default=None, help="stop after N designs")
-    ap.add_argument("--progress", choices=("auto", "bar", "lines"), default="auto",
+    ap.add_argument("--progress", choices=("auto", "bar", "lines", "json"), default="auto",
                     help="auto uses a bar on a terminal and one line per cell "
-                         "otherwise (default: %(default)s)")
+                         "otherwise; json prints one event object per line for a "
+                         "program to read, and moves every other message to "
+                         "stderr (default: %(default)s)")
     args = ap.parse_args()
+    if args.designs and args.knob:
+        ap.error("--designs and --knob both choose the design points; give one")
+
+    # In json mode stdout carries only events, so a reader can parse every line.
+    say = (lambda *a: print(*a, file=sys.stderr, flush=True)) \
+        if args.progress == "json" else print
 
     # Resolved, not as given: every cell path derives from this, and a relative
     # spelling made build_mesh.py fail when it tried to report an ELF path
@@ -404,9 +475,12 @@ def main():
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     knobs = [parse_knob(k) for k in args.knob]
-    designs = expand(args.grid, knobs)
-    if knobs:
-        print("sweeping " + "; ".join(
+    explicit = load_designs(args.designs) if args.designs else None
+    designs = expand(args.grid, knobs, explicit)
+    if explicit is not None:
+        say(f"sweeping {len(designs)} design points from {args.designs}")
+    elif knobs:
+        say("sweeping " + "; ".join(
             f"{k} over {', '.join(str(v) for v in vs)}" for k, vs in knobs))
     if args.limit:
         designs = designs[:args.limit]
@@ -448,8 +522,8 @@ def main():
 
     rows = [json.loads(l) for l in jsonl.read_text().splitlines() if l.strip()]
     ok = sum(1 for r in rows if r["status"] == "ok")
-    print(f"\n{n} rows -> {jsonl}")
-    print(f"{ok} ok, {n - ok} not, in {Progress._clock(time.time() - prog.t0)}")
+    say(f"\n{n} rows -> {jsonl}")
+    say(f"{ok} ok, {n - ok} not, in {Progress._clock(time.time() - prog.t0)}")
 
 
 if __name__ == "__main__":

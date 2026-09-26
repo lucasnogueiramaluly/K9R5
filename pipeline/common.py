@@ -25,6 +25,28 @@ WORK = ROOT / "work"
 RESULTS = ROOT / "results"
 
 
+# An op that ships its own evaluation set brings its own host program too: one
+# that loops over the set and scores it, instead of running a single inference
+# and diffing it. An op is recognised by the data header it carries.
+#
+#   header          the generated header that identifies the application
+#   main            the host program under runtime/mesh
+#   beacon          the regex for the single metrics line it prints
+#   samples_flag    what --images caps, for the message
+APPS = {
+    "mnist": {"header": "mnist_data.h", "main": "mnist_main.c", "unit": "image"},
+    "kws": {"header": "kws_data.h", "main": "kws_main.c", "unit": "clip"},
+}
+
+
+def detect_app(test_dir: Path):
+    """Which application this op directory is, if any."""
+    for name, app in APPS.items():
+        if (test_dir / app["header"]).is_file():
+            return name, app
+    return None, None
+
+
 DEBUG = False
 
 
