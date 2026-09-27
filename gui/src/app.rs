@@ -233,7 +233,12 @@ impl App {
                         job.phase = line.chars().take(70).collect();
                     }
                 }
+                let hint = backend::explain_missing_script(&self.settings, &line);
                 job.push_line(line);
+                if let Some(h) = hint {
+                    job.push_line(h.clone());
+                    job.phase = h;
+                }
             }
             JobEvent::SpawnFailed(msg) => {
                 job.push_line(msg.clone());
