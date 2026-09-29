@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from pipeline.experiment.provenance import (
+    capture_run_provenance,
     git_snapshot,
     git_snapshot_optional,
     patch_digests,
@@ -103,6 +104,28 @@ class ProvenanceTests(unittest.TestCase):
             records = patch_digests(root, ["z.patch", "a.patch"])
             self.assertEqual([r["path"] for r in records], ["a.patch", "z.patch"])
             self.assertTrue(all(r["digest"].startswith("sha256:") for r in records))
+
+    def test_run_source_set_is_location_independent_and_excludes_docs(self):
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            for root in (Path(a), Path(b)):
+                (root / "pipeline/hetero_platform").mkdir(parents=True)
+                (root / "runtime/mesh").mkdir(parents=True)
+                (root / "targets/hetero").mkdir(parents=True)
+                (root / "pipeline/run_hetero.py").write_text("run")
+                (root / "pipeline/hetero_platform/mapper.py").write_text("mapper")
+                (root / "runtime/mesh/cluster_main.c").write_text("cluster")
+                (root / "targets/hetero/system.py").write_text("target")
+                (root / "README.md").write_text("one")
+            first = capture_run_provenance(a)
+            (Path(a) / "README.md").write_text("two")
+            unchanged = capture_run_provenance(a)
+            (Path(a) / "runtime/mesh/cluster_main.c").write_text("changed")
+            changed = capture_run_provenance(a)
+            other = capture_run_provenance(b)
+        self.assertEqual(first["source_set"]["digest"], unchanged["source_set"]["digest"])
+        self.assertNotEqual(first["source_set"]["digest"], changed["source_set"]["digest"])
+        self.assertEqual(first["source_set"]["digest"], other["source_set"]["digest"])
+        self.assertFalse(first["k9r5"]["available"])
 
 
 if __name__ == "__main__":

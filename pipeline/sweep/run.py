@@ -465,11 +465,13 @@ def run_cell(design, model, out_dir, host, power, images, progress=None,
             },
             actual={
                 "mapping": result_doc.get("mapping", {}),
-                "result": res,
             },
+            measured=res,
             calibration_path=design_dir / "calibration.json",
             result_path=result,
             base_dir=out_dir,
+            source_root=ROOT,
+            include_sweep_sources=True,
         )
         row["run_fingerprint"] = manifest["run_fingerprint"]
         row["manifest"] = str((cell / "manifest.json").relative_to(out_dir))

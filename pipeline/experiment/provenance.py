@@ -7,7 +7,10 @@ import subprocess
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from .fingerprint import file_digest, fingerprint, sha256_bytes
+from .fingerprint import file_digest, file_set_digest, file_set_manifest, fingerprint, sha256_bytes
+
+
+_SOURCE_SUFFIXES = {".c", ".h", ".S", ".s", ".ld", ".py", ".json"}
 
 
 def _run_bytes(repo: Path, args: Sequence[str]) -> bytes:
@@ -103,6 +106,57 @@ def patch_digests(root: Path | str, paths: Iterable[Path | str]) -> list[dict]:
         records.append({"path": relative.as_posix(), "digest": file_digest(absolute)})
     records.sort(key=lambda item: item["path"])
     return records
+
+
+def _source_files_under(path: Path) -> list[Path]:
+    if not path.exists():
+        return []
+    return sorted(p for p in path.rglob("*")
+                  if p.is_file() and p.suffix in _SOURCE_SUFFIXES)
+
+
+def run_source_files(root: Path | str, *, include_sweep: bool = False) -> list[Path]:
+    """Causal source set for heterogeneous execution, excluding generated data."""
+    root = Path(root).resolve()
+    explicit = [
+        root / "pipeline" / "build_mesh.py",
+        root / "pipeline" / "common.py",
+        root / "pipeline" / "gen_system_header.py",
+        root / "pipeline" / "run_hetero.py",
+        root / "pipeline" / "experiment" / "matmul_gemm_implementation.py",
+    ]
+    if include_sweep:
+        explicit.extend([
+            root / "pipeline" / "sweep" / "design.py",
+            root / "pipeline" / "sweep" / "calibrate.py",
+            root / "pipeline" / "sweep" / "run.py",
+        ])
+    trees = [
+        root / "pipeline" / "hetero_platform",
+        root / "runtime" / "common",
+        root / "runtime" / "mesh",
+        root / "runtime" / "snitch",
+        root / "runtime" / "spatz",
+        root / "targets" / "hetero",
+    ]
+    paths = [path for path in explicit if path.is_file()]
+    for tree in trees:
+        paths.extend(_source_files_under(tree))
+    return sorted(set(paths))
+
+
+def capture_run_provenance(root: Path | str, *, include_sweep: bool = False) -> dict:
+    """Capture run identity even in a source-only runtime container."""
+    root = Path(root).resolve()
+    sources = run_source_files(root, include_sweep=include_sweep)
+    return {
+        "k9r5": git_snapshot_optional(root, name="k9r5"),
+        "source_set": {
+            "paths": file_set_manifest(root, sources),
+            "digest": file_set_digest(root, sources),
+            "include_sweep": include_sweep,
+        },
+    }
 
 
 def toolchain_snapshot(executable: Path | str,

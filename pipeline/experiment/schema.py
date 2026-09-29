@@ -10,6 +10,8 @@ from typing import Mapping
 class WorkloadSpec:
     path: str
     content_digest: str
+    workload_fingerprint: str
+    artifact_digests: tuple[dict, ...]
     application: str | None
     opset: tuple[dict, ...]
     inputs: tuple[dict, ...]
@@ -23,6 +25,8 @@ class WorkloadSpec:
         return {
             "path": self.path,
             "content_digest": self.content_digest,
+            "workload_fingerprint": self.workload_fingerprint,
+            "artifact_digests": [dict(x) for x in self.artifact_digests],
             "application": self.application,
             "opset": [dict(x) for x in self.opset],
             "inputs": [dict(x) for x in self.inputs],

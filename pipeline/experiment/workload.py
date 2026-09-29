@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .fingerprint import file_digest
+from .fingerprint import file_digest, file_set_digest, file_set_manifest
 from .schema import WorkloadSpec
 
 
@@ -42,6 +42,27 @@ def inspect_workload(model_path: Path | str, application: str | None = None) -> 
         model_path = model_path / "network.onnx"
     if not model_path.is_file():
         raise FileNotFoundError(f"workload model not found: {model_path}")
+
+    package = model_path.parent
+    # Generic operation packages name the model ``network.onnx``.  Preserve
+    # inspection of a standalone model with another name by hashing that
+    # actual entrypoint under its package-relative name.
+    artifact_paths = [model_path.name]
+    # Deeploy's current generic generation path loads these exact fixtures.
+    for name in ("inputs.npz", "outputs.npz"):
+        if (package / name).is_file():
+            artifact_paths.append(name)
+    # Application evaluation data is consumed by the selected runtime host
+    # program. Reuse the operational application registry, rather than making
+    # an experiment-side registry that can drift.
+    try:
+        from pipeline.common import detect_app
+        _detected, app = detect_app(package)
+    except ImportError:
+        app = None
+    if app is not None and (package / app["header"]).is_file():
+        artifact_paths.append(app["header"])
+    artifacts = file_set_manifest(package, artifact_paths)
 
     model = onnx.load(str(model_path))
     original_graph = model.graph
@@ -212,6 +233,8 @@ def inspect_workload(model_path: Path | str, application: str | None = None) -> 
     return WorkloadSpec(
         path=str(model_path),
         content_digest=file_digest(model_path),
+        workload_fingerprint=file_set_digest(package, artifact_paths),
+        artifact_digests=tuple(artifacts),
         application=application,
         opset=tuple({"domain": o.domain or "ai.onnx", "version": o.version}
                     for o in model.opset_import),

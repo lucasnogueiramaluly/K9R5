@@ -40,6 +40,11 @@ from Deeploy.EngineExtension.OptimizationPasses.TopologyOptimizationPasses.Engin
 
 from .engines import ClusterEngine, _all_fp32, working_set_bytes
 
+try:  # pipeline scripts import hetero_platform as a top-level package.
+    from experiment.matmul_gemm_implementation import resolve_matmul_gemm_implementation
+except ImportError:  # package imports used by the unit tests and tooling.
+    from pipeline.experiment.matmul_gemm_implementation import resolve_matmul_gemm_implementation
+
 # MACs per cycle, per engine and operator class.
 #
 # The two cluster rows are measured by `make mesh-test`, which runs exactly the
@@ -191,17 +196,9 @@ def deterministic_generic_fallback(engine_name: str, node: gs.Node) -> str | Non
     m = left[-1] if trans_a else left[-2]
     n = left[-2] if trans_a else left[-1]
     o = right[-2] if trans_b else right[-1]
-    if engine_name == "snitch":
-        if m == 0 or n == 0:
-            return "empty_input_dimension"
-        if o < 8:
-            return "output_columns_below_ssr_unroll"
-        return None
-    if m == 0 or n == 0 or o == 0:
-        return "empty_dimension"
-    if node.op == "Gemm" and (trans_a or trans_b):
-        return "transposed_operand"
-    return None
+    return resolve_matmul_gemm_implementation(
+        engine_name, node.op, m, n, o, transA=trans_a, transB=trans_b,
+    )["fallback_reason"]
 
 
 class CostEngineMapper(EngineMapper):

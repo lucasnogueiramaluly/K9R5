@@ -71,6 +71,40 @@ class WorkloadSpecTests(unittest.TestCase):
         self.assertEqual(legacy["op_types"], {"MatMul": 1})
         self.assertEqual(legacy["app"], "demo")
 
+    def test_package_fingerprint_selects_causal_artifacts_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_matmul(root / "network.onnx")
+            (root / "inputs.npz").write_bytes(b"inputs-one")
+            (root / "outputs.npz").write_bytes(b"outputs-one")
+            (root / "README.txt").write_text("unrelated")
+            first = inspect_workload(root)
+            (root / "README.txt").write_text("changed unrelated")
+            unchanged = inspect_workload(root)
+            (root / "inputs.npz").write_bytes(b"inputs-two")
+            changed_inputs = inspect_workload(root)
+            (root / "outputs.npz").write_bytes(b"outputs-two")
+            changed_outputs = inspect_workload(root)
+            _write_matmul(root / "network.onnx", dynamic=True)
+            changed_network = inspect_workload(root)
+        self.assertEqual(first.workload_fingerprint, unchanged.workload_fingerprint)
+        self.assertNotEqual(first.workload_fingerprint, changed_inputs.workload_fingerprint)
+        self.assertNotEqual(changed_inputs.workload_fingerprint, changed_outputs.workload_fingerprint)
+        self.assertNotEqual(changed_outputs.workload_fingerprint, changed_network.workload_fingerprint)
+        self.assertEqual([item["path"] for item in first.artifact_digests],
+                         ["inputs.npz", "network.onnx", "outputs.npz"])
+
+    def test_application_header_participates_in_package_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_matmul(root / "network.onnx")
+            (root / "mnist_data.h").write_text("one")
+            first = inspect_workload(root, application="mnist")
+            (root / "mnist_data.h").write_text("two")
+            changed = inspect_workload(root, application="mnist")
+        self.assertNotEqual(first.workload_fingerprint, changed.workload_fingerprint)
+        self.assertIn("mnist_data.h", [item["path"] for item in first.artifact_digests])
+
 
 if __name__ == "__main__":
     unittest.main()

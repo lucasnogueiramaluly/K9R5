@@ -13,7 +13,7 @@
 #       narrow AXI (8 B)                          wide AXI (64 B)
 #          │                                              │
 #     snitch cluster @ 0x1000_0000            spatz cluster @ 0x0010_0000
-#     9 cores, Snitch + FP subsystem          2 cores, Snitch + Spatz VPU
+#     9 cores, Snitch + FP subsystem          9 cores, Snitch + Spatz VPU
 #     (SSR data movers, FREP sequencer)       (4 lanes, VLSU into TCDM)
 #
 # There is no upstream GVSoC board that puts a CVA6 and Snitch clusters in one
