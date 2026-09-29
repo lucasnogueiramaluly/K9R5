@@ -2,6 +2,12 @@
 
 ## Goal
 
+This document is the forward-looking roadmap and retained milestone plan.
+For the current workbench architecture and researcher-facing usage, see
+[`../experimental-workbench.md`](../experimental-workbench.md). For the
+construction history, see
+[`foundation-checkpoints.md`](foundation-checkpoints.md).
+
 Evolve K9R5 incrementally into a reproducible and extensible experimental workbench for hardware/software co-design.
 
 The workbench should make it possible to extend hardware parameters, workloads, kernel implementations, mapping strategies, simulator profiles, software stacks, precision, tiling/memory policies, and engines without rebuilding experiment identity, provenance, calibration validity, manifests, and discovery infrastructure for every new feature.
@@ -9,6 +15,27 @@ The workbench should make it possible to extend hardware parameters, workloads, 
 Guiding rule:
 
 > Minimal input, deterministic resolution, explicit ambiguity, fully provenanceable results.
+
+## Frozen status
+
+The experiment foundation is complete on `lucas-ic`:
+
+```text
+6d40999  frozen luish18/K9R5 upstream base
+    |
+45bbb7d  Freeze experimental foundation M1-M8
+    |
+e97b2dc  Complete experimental provenance foundation M9
+```
+
+Current next step: **causal knob audit**. A knob being exposed, resolvable, or
+present in `ResourceSummary` does not yet prove that its full path through
+GVSoC construction and measured execution has been causally validated.
+
+See [`../experimental-workbench.md`](../experimental-workbench.md) for the
+researcher-facing methodology and
+[`foundation-checkpoints.md`](foundation-checkpoints.md) for the audited
+checkpoint history.
 
 ## Core experimental model
 
@@ -28,9 +55,9 @@ MEASURED
 cycles, correctness, accuracy and other observations
 ```
 
-## Existing foundation to verify from the actual repository
+## Frozen foundation components
 
-The current branch is expected to contain most or all of:
+At the frozen `e97b2dc` checkpoint, the branch contains:
 
 - deterministic fingerprint utilities;
 - source/dependency provenance;
@@ -50,9 +77,14 @@ The current branch is expected to contain most or all of:
 - `gui_query` experiment discovery;
 - sweep integration with resolved experiment metadata.
 
-Never assume these are present merely because this roadmap says so. Inspect the working tree.
+These are frozen implementation surfaces; operational source remains
+authoritative if this roadmap later drifts.
 
-## Remaining foundation milestones
+## Completed foundation milestones
+
+The milestone descriptions below are retained as the logical construction
+history of the foundation. M1-M8 were committed together at `45bbb7d`; M9 was
+committed at `e97b2dc`.
 
 ### Milestone 1 — Current state and sweep pin
 
@@ -154,9 +186,25 @@ Validate at four levels:
 
 Passing tests is necessary but not sufficient.
 
-## Out of scope until the foundation is frozen
+### Milestone 9 — Run identity and provenance hardening
 
-Unless separately requested, do not implement during these milestones:
+After the M1-M8 freeze, close the final identity gaps without changing
+simulated execution:
+
+- make `measured` first-class and separate from `actual`;
+- keep the ONNX digest while adding a whole-workload fingerprint;
+- separate final-run source provenance from calibration provenance;
+- centralize the audited Python interpretation of MatMul/Gemm fallback rules;
+- include the deterministic causal run source-set digest in `run_fingerprint`.
+
+Frozen at `e97b2dc`. Final canonical validation: 106 Python tests passed and
+the pinned-Spatz 32x32x32 MatMul regression remained exactly
+`node=6694`, `total=8183`, `status=ok`, `maxdiff=0.0`.
+
+## Deferred beyond the frozen foundation
+
+These items were deliberately deferred during foundation work and remain
+separate research or engineering tasks:
 
 - Deeploy tiling integration;
 - double buffering;

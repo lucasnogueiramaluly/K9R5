@@ -25,6 +25,28 @@ zero-latency targets (`cva6_ideal`, `snitch`, `spatz`), where every access compl
 in a single cycle and a cycle count is a pure compute cost. See
 [The memory system](#the-memory-system).
 
+## Experimental workbench
+
+The `lucas-ic` branch freezes an experiment-facing research layer at
+`e97b2dc`, on top of the existing K9R5 execution stack. It gives researchers a
+small request -> deterministic resolution interface, exposes catalogs/discovery
+for the current platform, records requested/resolved/actual/measured state, and
+adds resource, mapping, implementation, fingerprint and provenance evidence.
+It also hardens concrete silent-ambiguity cases found during the audit.
+
+Start with [the experimental-workbench guide](docs/experimental-workbench.md)
+for the conceptual overview and usage. Supporting references are the
+[chip-design parameter inventory](docs/chip-design-parameters.md),
+[foundation construction history](docs/dev/foundation-checkpoints.md),
+[extension-seam guide](docs/dev/extension-seams.md), and
+[workbench roadmap](docs/dev/k9r5-workbench-roadmap.md).
+
+The layer improves discovery, reproducibility and extension structure without
+claiming that future hardware/software features become trivial. Likewise, a
+parameter being exposed by the sweep is not, by itself, proof that its full
+request -> GVSoC construction -> runtime -> measurement path has been causally
+validated. Causal knob validation is the next research step.
+
 ## Setup
 
 Dependencies (GVSoC, Deeploy, the RISC-V toolchain) are large and are not tracked in
