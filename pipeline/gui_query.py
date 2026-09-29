@@ -26,6 +26,15 @@ sys.path.insert(0, str(HERE / "sweep"))
 from common import (APPS, DEEPLOY_TEST, GVSOC, PYTHON, ROOT, TC,  # noqa: E402
                     detect_app)
 import design as design_mod  # noqa: E402
+from experiment.discovery import (current_engine_catalog, current_host_profile_catalog,
+                                  current_kernel_implementation_catalog)  # noqa: E402
+from experiment.mapping_strategy_catalog import build_catalog as build_mapping_catalog  # noqa: E402
+from experiment.parameter_catalog import build_catalog  # noqa: E402
+from experiment.resolve import resolve_experiment  # noqa: E402
+from experiment.schema import ExperimentRequest  # noqa: E402
+from experiment.workload import (  # noqa: E402
+    inspect_workload, resolve_workload_path, workload_to_legacy_inspect,
+)
 
 
 def cmd_env(_args):
@@ -78,43 +87,14 @@ def cmd_ops(_args):
 
 def cmd_inspect(args):
     """Inputs, outputs and node types of an op directory or an .onnx file."""
-    import onnx  # only this subcommand needs it
-
-    p = Path(args.path)
-    if not p.is_absolute():
-        for cand in (Path.cwd() / p, ROOT / p, DEEPLOY_TEST / p):
-            if cand.exists():
-                p = cand
-                break
+    p = resolve_workload_path(args.path, roots=(ROOT, DEEPLOY_TEST))
     model_path = p / "network.onnx" if p.is_dir() else p
-    model = onnx.load(str(model_path))
-    g = model.graph
-    inits = {i.name for i in g.initializer}
-
-    def tensor(vi):
-        t = vi.type.tensor_type
-        dims = [d.dim_value if d.HasField("dim_value") else (d.dim_param or "?")
-                for d in t.shape.dim]
-        return {"name": vi.name, "dtype": onnx.TensorProto.DataType.Name(t.elem_type).lower(),
-                "shape": dims}
-
-    counts = {}
-    for n in g.node:
-        counts[n.op_type] = counts.get(n.op_type, 0) + 1
-    out = {
-        "path": str(model_path),
-        "opset": [{"domain": o.domain or "ai.onnx", "version": o.version}
-                  for o in model.opset_import],
-        "inputs": [tensor(i) for i in g.input if i.name not in inits],
-        "outputs": [tensor(o) for o in g.output],
-        "nodes": len(g.node),
-        "op_types": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
-        "initializers": len(inits),
-    }
+    app = None
     if p.is_dir():
         app, _ = detect_app(p)
-        out["app"] = app
-    return out
+    return workload_to_legacy_inspect(
+        inspect_workload(model_path, application=app)
+    )
 
 
 def cmd_knobs(_args):
@@ -129,8 +109,43 @@ def cmd_knobs(_args):
         "defaults": design_mod.DEFAULTS,
         "build_time": list(design_mod.BUILD_TIME),
         "ofat": sweep_run.OFAT,
+        "parameters": build_catalog(
+            design_mod.DEFAULTS,
+            design_mod.BUILD_TIME,
+            sweep_run.OFAT,
+        ),
         "build_key": design_mod.build_key({}),
     }
+
+
+def cmd_experiment_schema(_args):
+    """Current experiment-facing metadata, derived from operational sources."""
+    knobs = cmd_knobs(_args)
+    return {
+        "parameters": knobs["parameters"],
+        "engines": current_engine_catalog(ROOT),
+        "host_profiles": list(current_host_profile_catalog(ROOT).values()),
+        "mapping_strategies": build_mapping_catalog(),
+        "kernel_implementations": current_kernel_implementation_catalog(ROOT),
+        "presets": ["k9r5_current"],
+    }
+
+
+def cmd_resolve_experiment(args):
+    """Resolve one JSON ExperimentRequest without building or running anything."""
+    data = json.loads(Path(args.request).read_text())
+    request = ExperimentRequest.from_dict(data)
+    p = resolve_workload_path(request.workload, roots=(ROOT, DEEPLOY_TEST))
+    app = None
+    if p.is_dir():
+        app, _ = detect_app(p)
+    return resolve_experiment(
+        request,
+        design_api=design_mod,
+        host_profiles=current_host_profile_catalog(ROOT),
+        workload_path=p,
+        application=app,
+    ).to_dict()
 
 
 def cmd_validate(args):
@@ -166,6 +181,10 @@ def main():
     p.add_argument("path", help="op directory or .onnx file")
     p.set_defaults(fn=cmd_inspect)
     sub.add_parser("knobs").set_defaults(fn=cmd_knobs)
+    sub.add_parser("experiment-schema").set_defaults(fn=cmd_experiment_schema)
+    p = sub.add_parser("resolve-experiment")
+    p.add_argument("request", help="JSON ExperimentRequest file")
+    p.set_defaults(fn=cmd_resolve_experiment)
     p = sub.add_parser("validate")
     p.add_argument("designs", help="JSON list of partial designs")
     p.set_defaults(fn=cmd_validate)

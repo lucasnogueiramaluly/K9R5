@@ -37,6 +37,7 @@ import build_mesh  # noqa: E402
 from build_mesh import HOSTS, build_network  # noqa: E402
 from common import (APPS, GVSOC, PYTHON, RESULTS, ROOT, TARGETS, WORK,  # noqa: E402
                     detect_app, note_file, set_debug)
+from experiment.actual_implementation import annotate_completed_nodes  # noqa: E402
 
 DEEPLOY_TEST = ROOT / "deps" / "deeploy" / "DeeployTest"
 
@@ -410,7 +411,7 @@ def main():
                                  formatter_class = argparse.RawDescriptionHelpFormatter)
     ap.add_argument("op", help = "op dir (network.onnx + inputs.npz + outputs.npz)")
     ap.add_argument("--pin", choices = ["cva6", "snitch", "spatz"],
-                    help = "force every node the engine can run onto it")
+                    help = "prefer this engine for compatible nodes; not a whole-graph guarantee")
     ap.add_argument("--power", action = "store_true",
                     help = "enable GVSoC power modelling, so the per-cache "
                            "energy counters are populated (slower)")
@@ -507,6 +508,10 @@ def main():
     res = simulate(elfs, work / "run", len(mapping["nodes"]), args.timeout,
                    args.stall_timeout, args.quiet, target = HOSTS[args.host][1],
                    power = args.power)
+
+    # Post-simulation metadata only: join the completed beacon to the exact
+    # generated dispatch arguments without changing execution.
+    annotate_completed_nodes(mapping, res)
 
     report(op_name, mapping, res, out_path = args.out)
     sys.exit(0 if res["status"] == "ok" else 1)

@@ -47,6 +47,7 @@ from Deeploy.Targets.Generic.Platform import GenericOptimizer  # noqa: E402
 from hetero_platform import progress  # noqa: E402
 from hetero_platform.mapper import make_mapper  # noqa: E402
 from hetero_platform.deployment import HeteroPlatform  # noqa: E402
+from experiment.generated_arguments import emitted_kernel_arguments  # noqa: E402
 
 
 def is_fp32_network(input_types) -> bool:
@@ -81,7 +82,8 @@ def build_deployer(graph, input_types, input_offsets, state_dir, pin=None, host=
                                default_channels_first = True,
                                deeployStateDir = state_dir,
                                inputOffsets = input_offsets)
-    return EngineColoringDeployerWrapper(deployer, make_mapper(pin, host))
+    mapper_factory = make_mapper(pin, host)
+    return EngineColoringDeployerWrapper(deployer, mapper_factory), mapper_factory
 
 
 def main():
@@ -91,8 +93,8 @@ def main():
                     help = "directory holding network.onnx, inputs.npz, outputs.npz")
     ap.add_argument("-d", "--dump-dir", required = True, help = "where to write the C")
     ap.add_argument("--pin", default = None, choices = ["cva6", "snitch", "spatz"],
-                    help = "force every node the engine can run onto it, instead "
-                           "of letting the cost model choose")
+                    help = "prefer this engine for compatible nodes; incompatible nodes remain "
+                           "mapped normally, so this is not a whole-graph guarantee")
     ap.add_argument("--host", default = "cva6", choices = ["cva6", "ara"],
                     help = "the orchestrator the board carries, which sets the "
                            "rates the host engine is priced at (default: %(default)s)")
@@ -123,8 +125,9 @@ def main():
         input_types[f"input_{i}"] = _type
         input_offsets[f"input_{i}"] = offset
 
-    deployer = build_deployer(graph, input_types, input_offsets,
-                              str(dump_dir / "deeployStates"), args.pin, args.host)
+    deployer, mapper_factory = build_deployer(
+        graph, input_types, input_offsets, str(dump_dir / "deeployStates"),
+        args.pin, args.host)
 
     # The code transformations run inside prepare(), after lowering and
     # colouring but before code generation, so the progress pass has to read
@@ -139,7 +142,12 @@ def main():
         if layer is None:
             return "HES_ENGINE_CVA6", "?"
         engine = layer.node.attrs.get("engine", "cva6")
-        decided[name] = (engine, layer.node.op)
+        decided[name] = {
+            "index": progress.index_of(name),
+            "engine": engine,
+            "op": layer.node.op,
+            "layer": layer,
+        }
         return progress.ENGINE_MACRO.get(engine, "HES_ENGINE_CVA6"), layer.node.op
 
     progress.reset()
@@ -151,10 +159,24 @@ def main():
 
     generateTestNetwork(deployer, test_inputs, test_outputs, str(dump_dir), _NoVerbosity)
 
-    # Report the placement next to the generated code.
+    # Report the placement next to the generated code. The mapper explanation
+    # is descriptive state captured after the same decisions have been made.
+    mapper = mapper_factory.last_instance
+    explanations = getattr(mapper, "explanations", []) if mapper is not None else []
+    by_node = {entry["node"]: entry for entry in explanations}
     placement = []
-    for name, (engine, op) in decided.items():
-        placement.append({"node": name, "op": op, "engine": engine})
+    for name, decision in decided.items():
+        entry = {"index": decision["index"], "node": name,
+                 "op": decision["op"], "engine": decision["engine"]}
+        arguments = emitted_kernel_arguments(decision["layer"], decision["op"])
+        if arguments is not None:
+            entry["kernel_arguments"] = arguments
+        entry["mapping_explanation"] = by_node.get(name, {
+            "strategy": "measured_rate_greedy",
+            "status": "unavailable",
+            "reason": "mapper did not retain a decision for generated node",
+        })
+        placement.append(entry)
     (dump_dir / "mapping.json").write_text(json.dumps({
         "pin": args.pin,
         "host": args.host,

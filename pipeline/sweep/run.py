@@ -38,9 +38,21 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(ROOT / "pipeline"))
 
 import area as area_model          # noqa: E402
+from common import DEEPLOY_TEST, detect_app  # noqa: E402
 import design as design_mod        # noqa: E402
+from experiment.discovery import current_host_profile_catalog  # noqa: E402
+from experiment.resolve import resolve_experiment  # noqa: E402
+from experiment.schema import ExperimentRequest  # noqa: E402
+from experiment.workload import resolve_workload_path  # noqa: E402
+from experiment.calibration_artifact import (  # noqa: E402
+    cache_status,
+    capture_calibration_context,
+    write_metadata,
+)
+from experiment.run_manifest import write_run_manifest
 
 PYTHON = ROOT / ".venv" / "bin" / "python"
 MESH = ROOT / "runtime" / "mesh"
@@ -292,10 +304,16 @@ def sh(cmd, **kw):
 
 
 def prepare(design, cell_dir, env):
-    """The per-design work: its own mesh copy and generated header."""
+    """Refresh the per-design mesh copy, then generate its design header.
+
+    A sweep output directory may be reused after runtime/mesh changes. Keeping
+    an existing copy would silently build new experiments against stale runtime
+    sources, so the copy is replaced on every prepare() call.
+    """
     mesh = cell_dir / "mesh"
-    if not mesh.exists():
-        shutil.copytree(MESH, mesh)
+    if mesh.exists():
+        shutil.rmtree(mesh)
+    shutil.copytree(MESH, mesh)
     r = sh([PYTHON, ROOT / "pipeline" / "gen_system_header.py", "--out-dir", mesh], env=env)
     if r.returncode:
         raise RuntimeError(f"header generation failed:\n{r.stdout}\n{r.stderr}")
@@ -303,14 +321,20 @@ def prepare(design, cell_dir, env):
 
 
 def calibrate(design_dir, mesh, env, host):
-    """Re-measure the engine cost table for this design. Cached per design."""
+    """Return a calibration table valid for the exact inputs of this design."""
     rates = design_dir / "rates.json"
-    if rates.exists():
+    metadata = design_dir / "calibration.json"
+
+    design_path = Path(env["HES_DESIGN"])
+    resolved_design = json.loads(design_path.read_text())
+    context = capture_calibration_context(ROOT, resolved_design, host)
+    cached, _reason = cache_status(rates, metadata, context["input_fingerprint"])
+    if cached:
         return rates
 
     build = design_dir / "calib"
     r = sh([PYTHON, ROOT / "pipeline" / "build_mesh.py", "--test", "mesh_calib",
-            "--cluster", "cluster_main.c", "--host-extra", "hes_host.c",
+            "--cluster", "cluster_main.c", "--host-extra", "hes_host.c", "--host", host,
             "--mesh-dir", mesh, "--work-dir", build], env=env)
     if r.returncode:
         raise RuntimeError(f"calibration build failed:\n{r.stdout}\n{r.stderr}")
@@ -331,11 +355,13 @@ def calibrate(design_dir, mesh, env, host):
     r = sh([PYTHON, HERE / "calibrate.py", log, "-o", rates, "--host", host], env=env)
     if r.returncode:
         raise RuntimeError(f"calibration failed for this design:\n{r.stdout}\n{r.stderr}")
+
+    write_metadata(metadata, context, rates, log)
     return rates
 
 
 def run_cell(design, model, out_dir, host, power, images, progress=None,
-             frontend=None, serial=False):
+             frontend=None, serial=False, pin=None):
     """One (design, model) measurement."""
     def phase(name):
         if progress is not None:
@@ -365,8 +391,8 @@ def run_cell(design, model, out_dir, host, power, images, progress=None,
     try:
         phase("mesh + header")
         mesh = prepare(design, design_dir, env)
-        # Cached per design, so this is free for every model after the first.
-        phase("calibrating" if not (design_dir / "rates.json").exists() else "calibration cached")
+        # calibrate() validates the sidecar fingerprint before reusing rates.
+        phase("calibration cache check")
         rates = calibrate(design_dir, mesh, env, host)
         env["HES_RATES"] = str(rates)
 
@@ -384,13 +410,69 @@ def run_cell(design, model, out_dir, host, power, images, progress=None,
             cmd += ["--frontend", frontend]
         if serial:
             cmd.append("--serial")
+        if pin:
+            cmd += ["--pin", pin]
         phase("codegen + build + simulate")
         r = sh(cmd, env=env)
         if not result.exists():
             row.update(status="failed", reasons=[(r.stdout + r.stderr)[-1500:]])
             return row
-        res = json.load(result.open())["result"]
+        result_doc = json.load(result.open())
+        res = result_doc["result"]
         row["status"] = res.get("status", "unknown")
+
+        workload_path = resolve_workload_path(
+            model, roots=(ROOT, DEEPLOY_TEST)
+        )
+        workload_app = None
+        if workload_path.is_dir():
+            workload_app, _ = detect_app(workload_path)
+        experiment_request = ExperimentRequest(
+            workload=str(model),
+            design_overrides=tuple(sorted(design.items())),
+            host=host,
+            pin=pin,
+            frontend=frontend,
+            serial=serial,
+            power=power,
+        )
+        experiment_resolved = resolve_experiment(
+            experiment_request,
+            design_api=design_mod,
+            host_profiles=current_host_profile_catalog(ROOT),
+            workload_path=workload_path,
+            application=workload_app,
+        ).to_dict()
+
+        manifest = write_run_manifest(
+            cell / "manifest.json",
+            request={
+                "design": design,
+                "model": str(model),
+                "host": host,
+                "pin": pin,
+                "power": power,
+                "images": images,
+                "frontend": frontend,
+                "serial": serial,
+            },
+            resolved={
+                "design_slug": slug,
+                "design": design_mod.resolve(design),
+                "model": Path(model).name,
+                "host": host,
+                "experiment": experiment_resolved,
+            },
+            actual={
+                "mapping": result_doc.get("mapping", {}),
+                "result": res,
+            },
+            calibration_path=design_dir / "calibration.json",
+            result_path=result,
+            base_dir=out_dir,
+        )
+        row["run_fingerprint"] = manifest["run_fingerprint"]
+        row["manifest"] = str((cell / "manifest.json").relative_to(out_dir))
         for k in ("cycles", "cycles_per_image", "cycles_per_clip", "accuracy",
                   "offload_failures", "maxdiff", "caches", "per_engine_cycles",
                   # KWS runs both clusters at once, so its result is a max
@@ -447,6 +529,9 @@ def main():
                          "e.g. --knob SPATZ_NB_LANES=2,4,8")
     ap.add_argument("-o", "--out", required=True, help="sweep output directory")
     ap.add_argument("--host", default="cva6", choices=("cva6", "ara"))
+    ap.add_argument("--pin", choices=("cva6", "snitch", "spatz"), default=None,
+                    help="prefer this engine for compatible nodes only; it does not guarantee "
+                         "whole-graph execution; use for controlled isolation studies")
     ap.add_argument("--power", action="store_true", help="measure energy too (slower)")
     ap.add_argument("--frontend", choices=("snitch", "spatz"), default=None,
                     help="for keyword spotting: which cluster runs the MFCC "
@@ -513,7 +598,7 @@ def main():
                 prog.start(f"{shown} \u00b7 {Path(model).name}")
                 row = run_cell(d, model, out, args.host, args.power, args.images,
                                progress=prog, frontend=args.frontend,
-                               serial=args.serial)
+                               serial=args.serial, pin=args.pin)
                 fh.write(json.dumps(row) + "\n")
                 fh.flush()
                 n += 1

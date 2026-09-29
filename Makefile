@@ -9,7 +9,7 @@ MEM ?= real
 DBG := $(if $(DEBUG),--debug)
 TARGETS := cva6 snitch spatz cva6_real snitch_real spatz_real hetero_soc ara_v2 ara_host hetero_ara
 
-.PHONY: run gvsoc smoke ssr-test ara-test mesh-probe mesh-test hetero mnist kws clean
+.PHONY: run gvsoc smoke ssr-test ara-test mesh-probe mesh-test hetero mnist kws clean python-test
 
 # Snitch bare-metal test build (the pipeline's snitch flags, minus the
 # generated network) used by the ssr-test target below.
@@ -152,3 +152,7 @@ kws:
 
 clean:
 	rm -rf work/*
+
+# Pure-Python infrastructure tests; no GVSoC simulation required.
+python-test:
+	$(PY) -m unittest discover -s pipeline/tests -v
