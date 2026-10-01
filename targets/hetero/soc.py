@@ -187,6 +187,14 @@ class HeteroSoc(st.Component):
         narrow_axi = router.Router(self, 'narrow_axi', bandwidth=system.NARROW_AXI_WIDTH)
         wide_axi = router.Router(self, 'wide_axi', bandwidth=system.WIDE_AXI_WIDTH)
 
+        # The main-memory device, if main memory is a real RAM rather than a
+        # fixed latency (memsys.DRAM_KIND). Host refills and cluster DMA meet
+        # at the wide AXI, so that is where it goes; the loaders get a port of
+        # their own around it (load_ico below), so loading the three ELFs does
+        # not leave the device busy when the cores start.
+        dram_ctrl = memsys.make_main_memory(self)
+        load_ico = router.Router(self, 'load_ico') if dram_ctrl is not None else None
+
         # Clusters. Each gets its own properties object, which is what lets one
         # board hold a 9-core Snitch cluster and a 2-core Spatz pair.
         clusters = {}
@@ -297,9 +305,19 @@ class HeteroSoc(st.Component):
         # --- SoC interconnect ---
         # Main memory hangs off the wide router; the narrow one forwards to it,
         # as on GVSoC's own Snitch board.
-        wide_axi.o_MAP(mem.i_INPUT(), name='hbm', base=system.HBM_BASE,
-                       size=system.HBM_SIZE, rm_base=True,
-                       latency=memsys.DRAM_LATENCY)
+        if dram_ctrl is None:
+            wide_axi.o_MAP(mem.i_INPUT(), name='hbm', base=system.HBM_BASE,
+                           size=system.HBM_SIZE, rm_base=True,
+                           latency=memsys.DRAM_LATENCY)
+        else:
+            wide_axi.o_MAP(dram_ctrl.i_INPUT(), name='hbm', base=system.HBM_BASE,
+                           size=system.HBM_SIZE, rm_base=True)
+            dram_ctrl.o_OUTPUT(mem.i_INPUT())
+            load_ico.o_MAP(mem.i_INPUT(), name='hbm', base=system.HBM_BASE,
+                           size=system.HBM_SIZE, rm_base=True)
+            load_ico.o_MAP(dram.i_INPUT(), name='dram', base=system.DRAM_BASE,
+                           size=system.DRAM_SIZE)
+        loader_port = mem_ico if load_ico is None else load_ico
         narrow_axi.o_MAP(wide_axi.i_INPUT(), name='hbm', base=system.HBM_BASE,
                          size=system.HBM_SIZE, rm_base=False)
         wide_axi.o_MAP(rom.i_INPUT(), name='rom', base=system.BOOTROM_BASE,
@@ -321,7 +339,7 @@ class HeteroSoc(st.Component):
         # starts with everything cold, as it would after reset.
         host_loader = utils.loader.loader.ElfLoader(self, 'loader_host',
                                                    binary=host_binary)
-        host_loader.o_OUT(mem_ico.i_INPUT())
+        host_loader.o_OUT(loader_port.i_INPUT())
         self.bind(host_loader, 'start', host, 'fetchen')
 
         for cluster in system.CLUSTERS:
@@ -333,7 +351,7 @@ class HeteroSoc(st.Component):
                 continue
             loader = utils.loader.loader.ElfLoader(self, f'loader_{cluster.name}',
                                                    binary=binary)
-            loader.o_OUT(mem_ico.i_INPUT())
+            loader.o_OUT(loader_port.i_INPUT())
             # Release the cluster's cores once its image is in memory.
             loader.o_START(clusters[cluster.name].i_FETCHEN())
 

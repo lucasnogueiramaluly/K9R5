@@ -88,3 +88,45 @@ pub fn small_button<'a, M: Clone + 'a>(label: &'a str, on: Option<M>) -> button:
 pub fn lines<'a, M: 'a>(items: impl IntoIterator<Item = Element<'a, M>>) -> Column<'a, M> {
     Column::with_children(items).spacing(2)
 }
+
+/// Main-memory device, as `--dram` takes it (targets/hetero/dram_presets.py).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DramChoice {
+    Fixed,
+    Lpddr4,
+    Lpddr4x,
+    Lpddr5,
+    HyperRam,
+}
+
+impl DramChoice {
+    pub const ALL: [DramChoice; 5] =
+        [DramChoice::Fixed, DramChoice::Lpddr4, DramChoice::Lpddr4x, DramChoice::Lpddr5, DramChoice::HyperRam];
+
+    /// The `--dram` value.
+    pub fn arg(self) -> &'static str {
+        match self {
+            DramChoice::Fixed => "fixed",
+            DramChoice::Lpddr4 => "lpddr4",
+            DramChoice::Lpddr4x => "lpddr4x",
+            DramChoice::Lpddr5 => "lpddr5",
+            DramChoice::HyperRam => "hyperram",
+        }
+    }
+
+    pub fn from_arg(s: &str) -> DramChoice {
+        DramChoice::ALL.into_iter().find(|d| d.arg() == s).unwrap_or(DramChoice::Fixed)
+    }
+}
+
+impl std::fmt::Display for DramChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DramChoice::Fixed => "fixed latency",
+            DramChoice::Lpddr4 => "LPDDR4-3200",
+            DramChoice::Lpddr4x => "LPDDR4X-4266",
+            DramChoice::Lpddr5 => "LPDDR5-6400",
+            DramChoice::HyperRam => "HyperRAM 200 MHz",
+        })
+    }
+}

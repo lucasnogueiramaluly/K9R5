@@ -5,8 +5,8 @@
 # replaced by the hierarchy a CVA6 SoC actually has:
 #
 #     host.fetch ── L1 I$ ─┐
-#                          ├─ l2_ico ── L2 ── mem_ico ── DRAM
-#     host.data ── dico ───┘                              (DRAM_LATENCY)
+#                          ├─ l2_ico ── L2 ──[dram_ctrl]── mem_ico ── DRAM
+#     host.data ── dico ───┘     (DRAM_LATENCY, or the device in memsys.DRAM_KIND)
 #                    ├── stdout / control_regs / dram      uncached
 #                    └── (only 0x8000_0000 is cacheable)
 #
@@ -83,6 +83,12 @@ class Soc(st.Component):
 
         loader = utils.loader.loader.ElfLoader(self, 'loader', binary=binary)
 
+        # The main-memory device, if main memory is a real RAM rather than a
+        # fixed latency (memsys.DRAM_KIND). It sits between the L2 and main
+        # memory, so it sees exactly what the L2 sends down and nothing the
+        # loader writes.
+        dram_ctrl = memsys.make_main_memory(self)
+
         #
         # Bindings
         #
@@ -100,11 +106,16 @@ class Soc(st.Component):
         dcache.o_OUTPUT(l2_ico.i_INPUT(1))
         l2_ico.o_MAP(l2.i_INPUT(), name='l2', base=MEM_BASE, size=MEM_SIZE, rm_base=False)
 
-        # The L2 refills from main memory. The mapping latency is what a miss
-        # all the way down to DRAM costs; the L2 charges it only on a miss.
-        l2.o_OUTPUT(mem_ico.i_INPUT())
+        # The L2 refills from main memory. With the fixed model the mapping
+        # latency is what a miss all the way down to DRAM costs, charged by the
+        # L2 only on a miss; with a device, the device times it instead.
+        if dram_ctrl is None:
+            l2.o_OUTPUT(mem_ico.i_INPUT())
+        else:
+            l2.o_OUTPUT(dram_ctrl.i_INPUT())
+            dram_ctrl.o_OUTPUT(mem_ico.i_INPUT())
         mem_ico.o_MAP(mem.i_INPUT(), name='mem', base=MEM_BASE, size=MEM_SIZE, rm_base=True,
-            latency=memsys.DRAM_LATENCY)
+            latency=memsys.DRAM_LATENCY if dram_ctrl is None else 0)
         # The loader shares this router, so it needs to reach every region a
         # program segment can be linked into.
         mem_ico.o_MAP(dram.i_INPUT(), name='dram', base=0xB0000000, size=0x10000000,
@@ -125,7 +136,7 @@ class AraHostChip(st.Component):
 
         super(AraHostChip, self).__init__(parent, name, options=options)
 
-        clock = Clock_domain(self, 'clock', frequency=10000000)
+        clock = Clock_domain(self, 'clock', frequency=system.FREQUENCY)
 
         soc = Soc(self, 'soc', parser)
 

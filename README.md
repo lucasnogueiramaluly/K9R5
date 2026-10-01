@@ -125,6 +125,17 @@ Compare the two memory models on the same op:
 
 Results land in `results/<op>.json` and `results/<op>-ideal.json`.
 
+Put a real RAM device behind the caches instead of the fixed main-memory latency
+(see [Real RAM devices](#real-ram-devices---dram)):
+
+```bash
+.venv/bin/python pipeline/run.py Tests/Kernels/FP32/MatMul --cores cva6,snitch,spatz,ara --dram lpddr4
+.venv/bin/python pipeline/run_hetero.py ops/mnist --dram hyperram        # also: make mnist DRAM=hyperram
+```
+
+`--dram` takes `fixed` (the default), `lpddr4`, `lpddr4x`, `lpddr5` or `hyperram`;
+results get a `-<kind>` suffix so they never overwrite the fixed-latency baselines.
+
 ### Debugging a run
 
 `--debug` (or `-d`, or `HES_DEBUG=1`, or `make run DEBUG=1`) traces every command
@@ -182,8 +193,8 @@ The tabs:
 | tab | what it does |
 |-----|--------------|
 | Models & ops | list `ops/` (and Deeploy's kernel tests), inspect a graph's inputs, outputs and node types, import an `.onnx` with an `inputs.npz` or random inputs, regenerate `ops/mnist` and `ops/kws` |
-| Compare cores | run ops on any of cva6 / snitch / spatz / ara standalone (`run.py`), or on the SoC mapped or pinned (`run_hetero.py`); bar charts, speedups, cache counters, node mapping |
-| Sweep | pick models, host and samples; set the parameter space as one-factor-at-a-time, full factorial or an explicit list of points; check the points against `design.py` before launching; save/load the spec |
+| Compare cores | run ops on any of cva6 / snitch / spatz / ara standalone (`run.py`), or on the SoC mapped or pinned (`run_hetero.py`), with the main memory of your choice (`--dram`); bar charts, speedups, cache counters, node mapping |
+| Sweep | pick models, host, samples and main memory; set the parameter space as one-factor-at-a-time, full factorial or an explicit list of points; check the points against `design.py` before launching; save/load the spec |
 | Sweep results | live progress, the sensitivity table and Pareto front from `report.py`, every cell, CSV export |
 | Jobs | the queue, live logs, cancel, and the exact command of each job |
 
@@ -471,6 +482,11 @@ targets/ara_host.py    CVA6 + Ara vector unit, modelled memory (--cores ara)
 targets/hetero_soc.py  the SoC: CVA6 host + Snitch cluster + Spatz pair (make hetero/mnist/kws)
 targets/hetero_ara.py  the same SoC with the vector host (HOST=ara)
 targets/hetero/        memory-system parameters + the timing-cache model (C++ and generator)
+targets/hetero/dram*   the main-memory device model: engine (dram_core.hpp), GVSoC wrapper
+                       (dram.cpp/.py) and the LPDDR4/4X/5 and HyperRAM presets (dram_presets.py)
+targets/hetero_models.py  build-only target that compiles the optional models
+tools/dram/            DRAM engine unit tests, trace replay, preset check (`make dram-test`)
+tools/dram/xcheck/     cross-check against DRAMSys and Ramulator2 (`make dram-xcheck`)
 deps/patches/          local fixes to GVSoC models (tracked; applied by setup.sh)
 deps/gvsoc             GVSoC checkout + build           (untracked)
 deps/deeploy           Deeploy, installed editable      (untracked)
@@ -732,6 +748,126 @@ local memory before the timed region on every core — `bench_main` copies the i
 into the network buffers, which warms the CVA6 caches the same way `crt0` fills the
 TCDM. What the modelled memory system charges for is therefore the steady-state cost:
 capacity misses, store traffic and instruction refills, not the cold start.
+
+### Real RAM devices (`--dram`)
+
+`DRAM_KIND` in [`memsys.py`](targets/hetero/memsys.py) (or `--dram` on `run.py`,
+`run_hetero.py` and `sweep/run.py`, or `DRAM=` on `make run/hetero/mnist/kws`)
+replaces the constant main-memory latency with a model of an actual part:
+
+| kind | device | source of the numbers | unloaded line read | peak |
+|---|---|---|---|---|
+| `fixed` | -- (the default) | -- | 100 cycles | 8 B/cycle |
+| `lpddr4` | LPDDR4-3200, x16, 8 banks | DRAMSys memspec `JEDEC_8Gb_LPDDR4-3200_16bit` | 71.9 ns = 72 cycles | 6.4 GB/s |
+| `lpddr4x` | LPDDR4X-4266, x16, 8 banks | DRAMSys memspec `JEDEC_1Gbx16_LPDDR4-4266` | 66.4 ns = 67 cycles | 8.5 GB/s |
+| `lpddr5` | LPDDR5-6400, x16, 4 bank groups x 4 | Ramulator2 `LPDDR5_6400` / `LPDDR5_8Gb_x16` (JESD209-5C) | 68.8 ns = 69 cycles | 12.8 GB/s |
+| `hyperram` | HyperRAM 2.0, x8 @ 200 MHz | Infineon S27KS/S70KS data sheets | 265 ns = 265 cycles | 0.4 GB/s |
+
+The line read includes a 20 ns controller + PHY allowance (`ctrl_ps`, an
+assumption, overridable like every other field through `DRAM_OVERRIDES`).
+Cycles are at the 1 GHz core clock (`FREQUENCY`, which was a nominal 10 MHz before
+anything in the model depended on time; with `fixed` the change is cycle-neutral,
+checked against the committed MatMul per-core, MatMul SoC and KWS baselines).
+
+What [`dram_core.hpp`](targets/hetero/dram_core.hpp) models: per-bank open rows
+(open-page policy) with tRCD/tRP/tRAS/tRC, tRRD and the tFAW window, tCCD
+(short/long across bank groups), read-to-write and write-to-read turnarounds,
+write recovery, one data bus per channel, all-bank refresh every tREFI for tRFC
+(scheduled before any access that would run into it), and a 32-entry write
+queue: writes are posted, go to the DRAM when it would otherwise idle or in a
+batch past a watermark, and a read that hits a queued write is answered from it.
+Reads are served in arrival order -- the caches above miss in order, so a
+reordering controller would rarely have anything to reorder -- and each request
+is widened to the 64-byte line it refills. HyperRAM is a single bus: command/address phase,
+fixed double initial latency (the device default), two bytes per clock on x8,
+transfers split at tCSM. Not modelled: FR-FCFS reordering, per-bank refresh,
+power-down, command-bus contention, the LPDDR5 two-part ACT.
+
+Where it sits: between the L2 and main memory on the CVA6/Ara boards, on the wide
+AXI port where host refills and cluster DMA meet on the SoC, and between the chip
+and HBM on the stock Snitch/Spatz boards. The ELF loaders bypass it (they would
+otherwise leave it busy when the cores start), and debug accesses -- including
+the hits the timing caches forward to fetch bytes -- pass through untimed, the
+lesson of the router bandwidth bug in the Ara section.
+
+With a device, the L2 also becomes **write-back** (`L2_WRITEBACK`): only refills
+and dirty evictions reach main memory. Under the original write-through L2 every
+store would pay a DRAM write burst and a bus turnaround, which is a model artefact,
+not a memory cost. The fixed model keeps write-through so its numbers stay what
+they were.
+
+Same binaries, `--dram` across the board (MatMul per core; MNIST and KWS on the
+whole SoC, per sample):
+
+| | fixed | lpddr4 | lpddr4x | lpddr5 | hyperram |
+|---|---|---|---|---|---|
+| MatMul, cva6 | 119,037 | 118,895 | 118,880 | 119,088 | 119,744 |
+| MatMul, snitch | 12,603 | 11,857 | 12,169 | 11,849 | 15,408 |
+| MatMul, spatz | 6,815 | 6,005 | 5,915 | 6,121 | 9,791 |
+| MatMul, ara | 74,478 | 74,124 | 74,024 | 73,952 | 84,758 |
+| MNIST, cycles/image | 570,385 | 580,927 | 578,073 | 574,748 | 750,740 (+32%) |
+| KWS, cycles/clip | 256,652 | 261,545 | 259,822 | 256,840 | 395,141 (+54%) |
+
+Two things show. LPDDR is close to the fixed model's 100-cycle guess for a lone
+miss but different in shape: the cluster DMA streams that dominate MNIST and KWS
+find their rows open 93-98% of the time and run at bus speed, which the fixed
+model gets slightly wrong in both directions (cheaper per access, but 6.4 B/cycle
+of LPDDR4 instead of the AXI's 64). And HyperRAM is what a memory system that is
+actually slow looks like: 0.4 GB/s turns KWS, whose two clusters stream weights
+and features at once, 54% slower, while a CVA6 kernel that lives in its 512 KiB
+L2 barely notices.
+
+How it is checked: `make dram-test` runs hand-computed JEDEC cases through the
+engine (row hit/miss/conflict, tRRD, tFAW, tWTR, tRTW, refresh, HyperBus latency
+and tCSM) and checks that the latency the header generator derives for every
+preset equals what the engine does. `make dram-xcheck` replays synthetic access
+patterns through DRAMSys (LPDDR4/4X, from the same memspec files) and Ramulator2
+(LPDDR5, from the same presets) and compares read latencies request by request:
+
+| pattern | compared | LPDDR4 vs DRAMSys | LPDDR4X vs DRAMSys | LPDDR5 vs Ramulator2 |
+|---|---|---|---|---|
+| `sequential` | latency | +8.3% | +5.3% | +5.2% |
+| `bank_rotate` | latency | +15.4% (+0.3%\*) | +16.2% (+0.3%\*) | +7.1% |
+| `row_conflict` | latency | -1.5% | -1.0% | +15.5% (-0.0%\*) |
+| `random` | latency | +3.6% | +5.5% | +2.4% |
+| `read_write` | latency | +5.0% | +3.5% | -2.9% |
+| `stream` | throughput | -0.3% | +1.2% | -0.4% |
+| `bank_rotate_sat` | throughput | -2.4% | -3.3% | -0.2% |
+| `read_write_sat` | throughput | -8.5% | -8.2% | +0.9% |
+
+Our engine minus the reference: mean read latency on the patterns that leave
+the DRAM time to breathe, sustained read bandwidth on the saturating ones (where
+latency only measures how deep a queue each tool lets build). Outside the three
+starred cells everything is within 10%, and with the reads that arrive around a
+refresh left out, every latency pattern is within 5% (the figure in brackets for
+the starred ones). What remains is one behaviour, not a timing error: both
+references reorder the queue that piles up behind a refresh -- DRAMSys's FIFO is
+per bank, Ramulator2 is FR-FCFS -- so row hits on banks that are already open
+overtake older requests still waiting for their ACT. This model fixes a request's
+latency when it arrives and serves the backlog in order, which errs on the slow
+side for a few hundred nanoseconds every 3.9 us.
+
+The cross-check is also what fixed the presets: it showed LPDDR4 reads missing
+the four clocks of the RD-1/CAS-2 command and tDQSCK, LPDDR5 accesses missing
+the CAS (WCK-sync) clock and the longer same-bank-group turnarounds, and a
+strictly in-order controller paying a turnaround for every write -- which is why
+the presets now have a write queue (posted writes, drained when the DRAM is idle
+or in a batch past a watermark, as Ramulator2's controller does). HyperRAM has
+no open cycle-level reference; its arithmetic is in the unit tests.
+
+`make dram-xcheck` builds the references into their own image
+([`tools/dram/xcheck/Dockerfile`](tools/dram/xcheck/Dockerfile), ~3 GB); with
+less disk, run [`build_refs.sh`](tools/dram/xcheck/build_refs.sh) inside the
+hetero-sim dev container (~300 MB) and then `tools/dram/xcheck/run.py`, which is
+how the table above was produced.
+
+Why not the DRAM models GVSoC already ships: its DRAMSys bridge (`memory.dramsys`)
+needs a SystemC build and answers reads asynchronously while ignoring debug
+accesses, which the timing caches depend on; its Ramulator bridge
+(`memory.ramulator`) speaks only the newer io_v2 beat protocol, and everything in
+this hierarchy is io v1 with no bridge between the two; its HyperRAM model is a
+pin-level device behind PULP's uDMA, not something a core can load from. Both
+simulators are used here instead as references, offline.
 
 ## Caveats
 

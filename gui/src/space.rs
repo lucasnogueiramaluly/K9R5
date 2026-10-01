@@ -47,6 +47,8 @@ pub struct SweepSpec {
     /// KWS only: the cluster running the MFCC front-end.
     pub frontend: Option<String>,
     pub serial: bool,
+    /// Main-memory device for every cell (`--dram`), "fixed" for the default.
+    pub dram: String,
     pub mode: SpaceMode,
     /// Knob -> values as typed ("2,4,8", hex allowed). Kept as text so a
     /// half-typed field survives a save.
@@ -65,6 +67,7 @@ impl Default for SweepSpec {
             images: 16,
             frontend: None,
             serial: false,
+            dram: "fixed".into(),
             mode: SpaceMode::Ofat,
             values: BTreeMap::new(),
             list: String::new(),
@@ -201,6 +204,9 @@ impl SweepSpec {
         if let Some(fe) = &self.frontend {
             inv = inv.arg("--frontend").arg(fe.clone());
         }
+        if !self.dram.is_empty() && self.dram != "fixed" {
+            inv = inv.arg("--dram").arg(self.dram.clone());
+        }
         inv
     }
 }
@@ -272,6 +278,17 @@ mod tests {
                 && a.contains("--serial")
                 && a.contains("--frontend spatz")
         );
+    }
+
+    #[test]
+    fn invocation_carries_the_main_memory_only_when_set() {
+        let fixed = SweepSpec::default().invocation("o", "d.json");
+        assert!(!fixed.args.iter().any(|a| a == "--dram"));
+        let s = SweepSpec { dram: "lpddr5".into(), ..SweepSpec::default() };
+        assert!(s.invocation("o", "d.json").args.join(" ").contains("--dram lpddr5"));
+        // A spec saved before the field existed loads as the fixed-latency model.
+        let old: SweepSpec = toml::from_str("name = \"x\"").unwrap();
+        assert_eq!(old.dram, "fixed");
     }
 
     #[test]

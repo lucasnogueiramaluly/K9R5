@@ -7,9 +7,13 @@ ROOT := $(CURDIR)
 MEM ?= real
 # DEBUG=1 traces every command the pipeline runs and the files it generated
 DBG := $(if $(DEBUG),--debug)
-TARGETS := cva6 snitch spatz cva6_real snitch_real spatz_real hetero_soc ara_v2 ara_host hetero_ara
+# DRAM=lpddr4|lpddr4x|lpddr5|hyperram puts a real RAM device behind the caches
+# instead of the fixed main-memory latency (targets/hetero/dram_presets.py)
+DBG += $(if $(DRAM),--dram $(DRAM))
+TARGETS := cva6 snitch spatz cva6_real snitch_real spatz_real hetero_soc ara_v2 ara_host hetero_ara hetero_models
 
-.PHONY: run gvsoc smoke ssr-test ara-test mesh-probe mesh-test hetero mnist kws clean
+.PHONY: run gvsoc smoke ssr-test ara-test mesh-probe mesh-test hetero mnist kws clean \
+        dram-test dram-xcheck
 
 # Snitch bare-metal test build (the pipeline's snitch flags, minus the
 # generated network) used by the ssr-test target below.
@@ -149,6 +153,25 @@ kws:
 	$(PY) pipeline/kws.py --clips $(CLIPS) $(if $(REUSE),--reuse)
 	$(PY) pipeline/run_hetero.py ops/kws --frontend $(FE) --host $(HOST) \
 	  $(if $(SERIAL),--serial) $(if $(PIN),--pin $(PIN)) $(DBG)
+
+# Main-memory device model (targets/hetero/dram_core.hpp): hand-computed JEDEC
+# timing cases, then every preset against the Python mirror that the headers
+# quote as HES_DRAM_LATENCY. Needs only a host C++17 compiler.
+dram-test:
+	@mkdir -p work/dram/bin
+	g++ -std=c++17 -O2 -Wall -Wextra -o work/dram/bin/dram_test tools/dram/dram_test.cpp
+	g++ -std=c++17 -O2 -Wall -Wextra -o work/dram/bin/dram_replay tools/dram/dram_replay.cpp
+	work/dram/bin/dram_test
+	python3 tools/dram/check_presets.py work/dram/bin/dram_replay
+
+# The same model against reference simulators -- DRAMSys for LPDDR4/4X,
+# Ramulator2 for LPDDR5 -- on synthetic access patterns. Builds its own image
+# (tools/dram/xcheck/Dockerfile) the first time; that takes a while.
+dram-xcheck:
+	docker build -t hetero-dram-xcheck tools/dram/xcheck
+	@mkdir -p work/dram_xcheck
+	docker run --rm --user "$$(id -u):$$(id -g)" -v "$(ROOT):/work" hetero-dram-xcheck \
+	  python3 /work/tools/dram/xcheck/run.py --out /work/work/dram_xcheck
 
 clean:
 	rm -rf work/*

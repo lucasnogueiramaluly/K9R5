@@ -335,7 +335,7 @@ def calibrate(design_dir, mesh, env, host):
 
 
 def run_cell(design, model, out_dir, host, power, images, progress=None,
-             frontend=None, serial=False):
+             frontend=None, serial=False, dram=None):
     """One (design, model) measurement."""
     def phase(name):
         if progress is not None:
@@ -345,6 +345,14 @@ def run_cell(design, model, out_dir, host, power, images, progress=None,
     design_dir = out_dir / "designs" / slug
     design_dir.mkdir(parents=True, exist_ok=True)
     path = design_mod.write(design, design_dir / "design.json")
+    if dram and dram != "fixed":
+        # The main-memory device is a property of the whole sweep, not a knob
+        # (knobs are integers end to end), so it is added to every cell's
+        # design here. Calibration, mapping and simulation all read this file,
+        # so they all see the same device.
+        full = json.loads(path.read_text())
+        full["DRAM_KIND"] = dram
+        path.write_text(json.dumps(full, indent=2, sort_keys=True) + "\n")
 
     env = dict(os.environ)
     env["HES_DESIGN"] = str(path)
@@ -355,6 +363,8 @@ def run_cell(design, model, out_dir, host, power, images, progress=None,
         row["frontend"] = frontend
     if serial:
         row["serial"] = True
+    if dram and dram != "fixed":
+        row["dram_kind"] = dram
 
     bad = design_mod.validate(design)
     if bad:
@@ -392,7 +402,7 @@ def run_cell(design, model, out_dir, host, power, images, progress=None,
         res = json.load(result.open())["result"]
         row["status"] = res.get("status", "unknown")
         for k in ("cycles", "cycles_per_image", "cycles_per_clip", "accuracy",
-                  "offload_failures", "maxdiff", "caches", "per_engine_cycles",
+                  "offload_failures", "maxdiff", "caches", "per_engine_cycles", "dram",
                   # KWS runs both clusters at once, so its result is a max
                   # rather than a sum. Dropping these would leave a sweep over
                   # cluster geometry unable to say whether a design improved the
@@ -455,6 +465,10 @@ def main():
                     help="for keyword spotting: take turns instead of pipelining, "
                          "which is the comparison that shows what the overlap buys")
     ap.add_argument("--images", default="16", help="samples per model run")
+    ap.add_argument("--dram", choices=("fixed", "lpddr4", "lpddr4x", "lpddr5", "hyperram"),
+                    default=None,
+                    help="main-memory device for every cell (default: fixed latency). Not a "
+                         "knob: run one sweep per device, into separate --out directories")
     ap.add_argument("--limit", type=int, default=None, help="stop after N designs")
     ap.add_argument("--progress", choices=("auto", "bar", "lines", "json"), default="auto",
                     help="auto uses a bar on a terminal and one line per cell "
@@ -513,7 +527,7 @@ def main():
                 prog.start(f"{shown} \u00b7 {Path(model).name}")
                 row = run_cell(d, model, out, args.host, args.power, args.images,
                                progress=prog, frontend=args.frontend,
-                               serial=args.serial)
+                               serial=args.serial, dram=args.dram)
                 fh.write(json.dumps(row) + "\n")
                 fh.flush()
                 n += 1

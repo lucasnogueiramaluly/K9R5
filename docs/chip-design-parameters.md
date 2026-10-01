@@ -91,11 +91,14 @@ worth trying.
 
 | Parameter | Current value | Where | What it controls |
 |---|---|---|---|
-| `FREQUENCY` | 10 MHz | [system.py:21](../targets/hetero/system.py:21) | Single clock domain for host, both clusters and memory |
+| `FREQUENCY` | 1 GHz | [memsys.py:33](../targets/hetero/memsys.py:33) (re-exported by system.py) | Single clock domain for host, both clusters and memory. Was 10 MHz; nothing was time-based then, so the change is cycle-neutral for `DRAM_KIND=fixed` (verified on MatMul per core and on the SoC). It matters once main memory is a real device: its timings are in ns, so this sets what a DRAM access costs in cycles |
+| `DRAM_KIND` | `fixed` | [memsys.py:43](../targets/hetero/memsys.py:43) | What main memory is: `fixed` (the two knobs below), or a device model behind the caches -- `lpddr4` (LPDDR4-3200 x16), `lpddr4x` (LPDDR4X-4266 x16), `lpddr5` (LPDDR5-6400 x16, 4 bank groups), `hyperram` (HyperRAM 2.0 x8 @ 200 MHz). Presets and sources in [dram_presets.py](../targets/hetero/dram_presets.py); `--dram` on run.py / run_hetero.py / sweep/run.py |
+| `DRAM_OVERRIDES` | `{}` | [memsys.py:62](../targets/hetero/memsys.py:62) | Per-field overrides of the device preset, in ps for timings (e.g. `{"channels": 2, "mapping": "RoBaCoCh", "ctrl_ps": 30000}`). Field names are `hetero_dram::int_fields()` |
+| `L2_WRITEBACK` | `DRAM_KIND != 'fixed'` | [memsys.py:130](../targets/hetero/memsys.py:130) | Write-back L2: only refills and dirty evictions reach main memory. Off for `fixed` so its results stay what they were |
 | `narrow_axi` bandwidth | 8 bytes/cycle | [soc.py:106](../targets/hetero/soc.py:106) | Bus width for core data accesses and host→cluster traffic |
 | `wide_axi` bandwidth | 64 bytes/cycle | [soc.py:107](../targets/hetero/soc.py:107) | Bus width for cluster DMA and instruction-cache refills |
-| `DRAM_LATENCY` | 100 cycles | [memsys.py:16](../targets/hetero/memsys.py:16) | Latency of an access reaching main memory (shared by all three cores since [snitch_memsys.py](../targets/hetero/snitch_memsys.py), which retunes GVSoC's stock 0-cycle Spatz HBM to this same value) |
-| `DRAM_WIDTH` | 8 bytes/cycle | [memsys.py:21](../targets/hetero/memsys.py:21) | Port bandwidth to main memory, sets how long a line refill occupies the port |
+| `DRAM_LATENCY` | 100 cycles (`fixed`) | [memsys.py:51](../targets/hetero/memsys.py:51) | Latency of an access reaching main memory (shared by all three cores since [snitch_memsys.py](../targets/hetero/snitch_memsys.py), which retunes GVSoC's stock 0-cycle Spatz HBM to this same value). With a device it is not a knob but derived: the unloaded closed-row line read (72 cycles LPDDR4, 67 LPDDR4X, 69 LPDDR5, 265 HyperRAM at 1 GHz) |
+| `DRAM_WIDTH` | 8 bytes/cycle (`fixed`) | [memsys.py:56](../targets/hetero/memsys.py:56) | Port bandwidth to main memory, sets how long a line refill occupies the port. Not used with a device, which owns the bandwidth |
 | `HBM_SIZE` | 2 GiB | [system.py:28](../targets/hetero/system.py:28) | Shared main memory capacity, one pool for host + both clusters |
 | `MAILBOX_SIZE` | 512 B | [system.py:279](../targets/hetero/system.py:279) | Job-descriptor size the host can post to a cluster |
 | `MAILBOX_MAX_ARGS` | 16 | [system.py:280](../targets/hetero/system.py:280) | Argument slots in a job descriptor |
@@ -134,7 +137,6 @@ before they become constants like the ones above:
 | Mixed-core clusters | homogeneous only | Would need a new cluster class — GVSoC currently builds every core in a cluster from one class |
 | D2D link `link_latency_ns` / `link_bandwidth_GBps` | unset | `D2DLink` exists in GVSoC (`pulp/chips/soft_hier_old/c2c_platform/`) but is wired to nothing in this board |
 | L3 (die-stacked scratchpad) size/latency | unset | Memory hierarchy stops at L2 → HBM today; no L3 level modelled |
-| HyperRAM part/clock | unset | No HyperRAM device attached to this board yet |
 | `core_type='fast'` | not used | Faster ISS but drops the decoupled FP subsystem Xssr/Xfrep numbers depend on — a real accuracy/speed trade-off, not a free switch |
 
 ## Notes for the thesis

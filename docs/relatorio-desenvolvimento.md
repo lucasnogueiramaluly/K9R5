@@ -57,6 +57,7 @@ fato, simultaneamente.
 | 08-27 | `fa45f2c`, `2acdec4` | GEMM real em RVV + 8 núcleos de cômputo por cluster; kernels RVV viram padrão do pipeline — **tabela final de operador único** |
 | 08-29 | `1efa098` | **CNN de MNIST classificada na malha completa**, ponta a ponta |
 | 09-01 | `030c7c3` | **Keyword spotting com os dois clusters simultâneos**: `hes_post`/`hes_wait`, front-end MFCC — 1,82× sobre o mesmo trabalho serial, e o Snitch sai de 0% para 50% da carga |
+| 10-01 | — | **Memória principal real**: LPDDR4, LPDDR4X, LPDDR5 e HyperRAM modeladas atrás das caches (seção 12) |
 
 As seções seguintes detalham cada marco com sua tabela de desempenho.
 
@@ -558,9 +559,10 @@ conclusão vale enquanto a próxima medição não a contradiz.
   ISS versus as atuais ~18). Fica como pergunta em aberto do plano original:
   publicar os resultados finais em 2×8 ou justificar a extrapolação para
   8×8.
-- **D2D e HyperRAM (memória 2.5D/3D)** do plano original não foram
-  implementados — o projeto convergiu para DRAM única antes de chegar a essa
-  fase.
+- **D2D e memória 2.5D/3D** do plano original não foram implementados — o
+  projeto convergiu para uma memória principal única antes de chegar a essa
+  fase. A HyperRAM existe agora como dispositivo de memória principal (seção
+  12), não como pilha 3D.
 - **A FFT do front-end KWS não é transmitida por SSR** (seção 9.3). É a lacuna
   mais clara deixada pela seção 9, e a razão pela qual o Spatz vence um estágio
   que o argumento de padrão de acesso previa para o Snitch.
@@ -574,3 +576,112 @@ conclusão vale enquanto a próxima medição não a contradiz.
 - **Um job por cluster em voo.** O mailbox guarda um descritor, o que basta para
   o pipeline de dois estágios desta seção mas impede, por exemplo, dois clipes
   em voo no mesmo cluster.
+
+## 12. Memória principal real: LPDDR4, LPDDR5 e HyperRAM (01/10)
+
+Até aqui a memória principal era um número: todo acesso que chegava a ela
+custava `DRAM_LATENCY` = 100 ciclos, e uma linha de cache ocupava a porta por
+`LINE_SIZE / DRAM_WIDTH` ciclos. Sem bancos, sem linhas abertas, sem refresh: o
+*padrão* de acesso não tinha custo. Esta seção troca esse número por um modelo
+de dispositivo real, selecionável com `--dram`.
+
+### 12.1 O que o GVSoC já oferecia, e por que não serviu
+
+| Modelo do GVSoC | Padrões | Por que não foi usado como memória do chip |
+|---|---|---|
+| `memory.dramsys` (ponte DRAMSys 5) | LPDDR4, DDR3/4/5, HBM2 (sem LPDDR5) | exige SystemC e um launcher próprio; responde leituras de forma assíncrona e ignora acessos de depuração — as caches temporais deste projeto dependem dos dois |
+| `memory.ramulator` (Ramulator 2) | DDR4 no exemplo; o Ramulator 2 tem LPDDR5 | fala só o protocolo io_v2 (*beats*); toda esta hierarquia é io v1 e o GVSoC não tem ponte entre os dois |
+| `devices.hyperbus.hyperram` | S27KS0641 | modelo de pinos atrás do uDMA da PULP; não é mapeado em memória, nenhum núcleo carrega dele |
+
+A decisão foi escrever um modelo próprio, síncrono, no mesmo estilo da cache
+temporal, com os parâmetros tirados exatamente das fontes que esses simuladores
+usam — e usar DRAMSys e Ramulator 2 como *referência*, fora da simulação.
+
+### 12.2 O modelo
+
+`targets/hetero/dram_core.hpp` é C++ puro (o mesmo código roda no GVSoC, nos
+testes e na comparação com as referências), com o tempo em picossegundos:
+bancos com linha aberta (política *open page*), tRCD/tRP/tRAS/tRC, tRRD e a
+janela tFAW, tCCD curto/longo entre grupos de bancos, as viradas
+leitura→escrita e escrita→leitura, recuperação de escrita, um barramento de
+dados por canal, refresh de todos os bancos a cada tREFI e uma fila de escrita
+de 32 entradas (escritas postadas, drenadas na ociosidade ou em lote). As
+leituras são atendidas em ordem — as caches acima erram em ordem — e cada
+pedido é alargado para a linha de 64 bytes que preenche. A HyperRAM é um barramento só: fase de
+comando/endereço, latência inicial dupla fixa (o padrão do dispositivo), dois
+bytes por ciclo em x8.
+
+| `--dram` | dispositivo | fonte | leitura de linha sem carga | pico |
+|---|---|---|---|---|
+| `lpddr4` | LPDDR4-3200 x16 | memspec do DRAMSys | 72 ciclos | 6,4 GB/s |
+| `lpddr4x` | LPDDR4X-4266 x16 | memspec do DRAMSys | 67 ciclos | 8,5 GB/s |
+| `lpddr5` | LPDDR5-6400 x16, 4×4 bancos | presets do Ramulator 2 (JESD209-5C) | 69 ciclos | 12,8 GB/s |
+| `hyperram` | HyperRAM 2.0 x8, 200 MHz | folhas de dados Infineon | 265 ciclos | 0,4 GB/s |
+
+Três mudanças acompanham o modelo. O relógio do chip passou de 10 MHz nominais
+para 1 GHz: com tempos em nanossegundos, é ele que diz quantos ciclos custa um
+acesso (com a memória fixa a troca não muda nenhum ciclo — conferido contra as
+tabelas já publicadas). A L2 passa a ser *write-back* quando há dispositivo:
+com a L2 *write-through* original, cada store pagaria uma rajada de escrita e
+uma virada de barramento na DRAM, um artefato do modelo e não um custo real.
+E os carregadores de ELF passam ao largo do dispositivo, que senão estaria
+ocupado quando os núcleos começam.
+
+### 12.3 O que muda nos números
+
+| | fixa | lpddr4 | lpddr4x | lpddr5 | hyperram |
+|---|---|---|---|---|---|
+| MatMul, spatz | 6.815 | 6.005 | 5.915 | 6.121 | 9.791 |
+| MatMul, snitch | 12.603 | 11.857 | 12.169 | 11.849 | 15.408 |
+| MatMul, cva6 | 119.037 | 118.895 | 118.880 | 119.088 | 119.744 |
+| MNIST, ciclos/imagem | 570.385 | 580.927 | 578.073 | 574.748 | 750.740 (+32%) |
+| KWS, ciclos/clipe | 256.652 | 261.545 | 259.822 | 256.840 | 395.141 (+54%) |
+
+A LPDDR fica perto do palpite de 100 ciclos para um erro isolado, mas com outra
+forma: os fluxos de DMA dos clusters encontram a linha aberta em 93–98% das
+rajadas e andam na velocidade do barramento — mais baratos por acesso que o
+modelo fixo, mas limitados aos 6,4 B/ciclo da LPDDR4 em vez dos 64 do AXI. A
+HyperRAM mostra o que é uma memória de fato lenta: o KWS, cujos dois clusters
+puxam pesos e atributos ao mesmo tempo, fica 54% mais lento, enquanto um
+kernel do CVA6 que cabe na L2 de 512 KiB quase não percebe.
+
+### 12.4 Como é verificado
+
+`make dram-test` passa casos JEDEC calculados à mão pelo motor e confere que a
+latência que o gerador de cabeçalhos deriva para cada preset é a que o motor
+produz. `make dram-xcheck` reproduz padrões de acesso sintéticos no DRAMSys
+(LPDDR4/4X, com os mesmos arquivos memspec) e no Ramulator 2 (LPDDR5, com os
+mesmos presets) e compara as latências de leitura pedido a pedido:
+
+| padrão | medida | LPDDR4 vs DRAMSys | LPDDR4X vs DRAMSys | LPDDR5 vs Ramulator2 |
+|---|---|---|---|---|
+| `sequential` | latência | +8.3% | +5.3% | +5.2% |
+| `bank_rotate` | latência | +15.4% (+0.3%\*) | +16.2% (+0.3%\*) | +7.1% |
+| `row_conflict` | latência | -1.5% | -1.0% | +15.5% (-0.0%\*) |
+| `random` | latência | +3.6% | +5.5% | +2.4% |
+| `read_write` | latência | +5.0% | +3.5% | -2.9% |
+| `stream` | vazão | -0.3% | +1.2% | -0.4% |
+| `bank_rotate_sat` | vazão | -2.4% | -3.3% | -0.2% |
+| `read_write_sat` | vazão | -8.5% | -8.2% | +0.9% |
+
+Diferença do nosso motor para a referência: latência média de leitura nos
+padrões que não saturam a DRAM, banda sustentada nos que saturam (aí a latência
+só mede a profundidade da fila que cada ferramenta deixa formar). Fora das três
+células marcadas, tudo fica dentro de 10%; tirando as leituras que chegam em
+volta de um refresh, todos os padrões de latência ficam dentro de 5% (o número
+entre parênteses). O que sobra é um comportamento, não um erro de temporização:
+as duas referências reordenam a fila que se forma atrás de um refresh — o FIFO
+do DRAMSys é por banco, o Ramulator 2 é FR-FCFS —, deixando acertos de linha em
+bancos já abertos passarem à frente de pedidos mais antigos que esperam seu ACT.
+Este modelo fixa a latência de cada pedido quando ele chega e atende o atraso em
+ordem, o que erra para o lado lento por algumas centenas de nanossegundos a cada
+3,9 µs.
+
+A comparação também foi o que corrigiu os presets: ela mostrou que faltavam às
+leituras da LPDDR4 os quatro ciclos do comando RD-1/CAS-2 e o tDQSCK; aos acessos
+da LPDDR5, o ciclo do CAS (sincronização do WCK) e as viradas mais longas dentro
+de um grupo de bancos; e que um controlador estritamente em ordem pagava uma
+virada por escrita — por isso os presets têm agora uma fila de escrita (escritas
+postadas, drenadas quando a DRAM está ociosa ou em lote acima de uma marca, como
+faz o controlador do Ramulator 2). A HyperRAM não tem referência aberta em nível
+de ciclo; sua aritmética está nos testes unitários.

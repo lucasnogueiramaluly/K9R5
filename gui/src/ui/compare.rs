@@ -7,7 +7,7 @@ use crate::backend::Invocation;
 use crate::jobs::JobKind;
 use crate::model::{HeteroResult, IsolatedResult, RunResult, fmt_cycles};
 use crate::widgets::charts::{Bar, BarChart};
-use iced::widget::{button, checkbox, column, container, radio, row, scrollable, table, text, text_input};
+use iced::widget::{button, checkbox, column, container, pick_list, radio, row, scrollable, table, text, text_input};
 use iced::{Element, Length, Task};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -34,6 +34,7 @@ pub struct State {
     selected: BTreeSet<String>,
     cores: BTreeSet<&'static str>,
     memory: &'static str,
+    dram: DramChoice,
     spatz_kernels: &'static str,
     timeout: String,
     host: &'static str,
@@ -57,6 +58,7 @@ impl Default for State {
             selected: BTreeSet::new(),
             cores: ["cva6", "snitch", "spatz"].into(),
             memory: "real",
+            dram: DramChoice::Fixed,
             spatz_kernels: "tuned",
             timeout: "600".into(),
             host: "cva6",
@@ -81,6 +83,7 @@ pub enum Msg {
     ToggleOp(String, bool),
     ToggleCore(&'static str, bool),
     Memory(&'static str),
+    Dram(DramChoice),
     SpatzKernels(&'static str),
     Timeout(String),
     Host(&'static str),
@@ -138,6 +141,7 @@ impl State {
                 }
             }
             Msg::Memory(m) => self.memory = m,
+            Msg::Dram(d) => self.dram = d,
             Msg::SpatzKernels(k) => self.spatz_kernels = k,
             Msg::Timeout(s) => self.timeout = s,
             Msg::Host(h) => self.host = h,
@@ -204,9 +208,11 @@ impl State {
                 }
                 let timeout: u32 = self.timeout.trim().parse().map_err(|_| "timeout must be whole seconds")?;
                 let cores: Vec<&str> = CORES.iter().copied().filter(|c| self.cores.contains(c)).collect();
+                // The device only exists in the modelled memory system.
+                let dram = if self.memory == "real" { self.dram } else { DramChoice::Fixed };
                 for op in &self.selected {
                     let out = format!("{run}/{}.json", op.replace('/', "_"));
-                    let inv = Invocation::new("pipeline/run.py")
+                    let mut inv = Invocation::new("pipeline/run.py")
                         .arg(op.clone())
                         .arg("--cores")
                         .arg(cores.join(","))
@@ -218,8 +224,12 @@ impl State {
                         .arg(timeout.to_string())
                         .arg("--out")
                         .arg(out.clone());
+                    if dram != DramChoice::Fixed {
+                        inv = inv.arg("--dram").arg(dram.arg());
+                    }
+                    let mem = if dram == DramChoice::Fixed { self.memory.to_string() } else { dram.arg().to_string() };
                     jobs.push(NewJob {
-                        title: format!("{op} on {} ({} memory)", cores.join(", "), self.memory),
+                        title: format!("{op} on {} ({mem} memory)", cores.join(", ")),
                         kind: JobKind::Run { out },
                         inv,
                     });
@@ -240,6 +250,10 @@ impl State {
                             inv = inv.arg("--pin").arg(p);
                         }
                         inv = inv.arg("--images").arg(images.to_string()).flag(self.power, "--power").arg("-q");
+                        if self.dram != DramChoice::Fixed {
+                            inv = inv.arg("--dram").arg(self.dram.arg());
+                            tag += &format!("-{}", self.dram.arg());
+                        }
                         if kws {
                             inv = inv.arg("--frontend").arg(self.frontend).flag(self.serial, "--serial");
                             tag += &format!("-fe{}{}", self.frontend, if self.serial { "-serial" } else { "" });
@@ -247,8 +261,10 @@ impl State {
                         let out = format!("{run}/{tag}.json");
                         inv = inv.arg("--out").arg(out.clone());
                         let place = if p == "mapped" { "mapped".to_string() } else { format!("pinned to {p}") };
+                        let mem =
+                            if self.dram == DramChoice::Fixed { String::new() } else { format!(", {}", self.dram) };
                         jobs.push(NewJob {
-                            title: format!("{op} on the SoC, {} host, {place}", self.host),
+                            title: format!("{op} on the SoC, {} host, {place}{mem}", self.host),
                             kind: JobKind::Run { out },
                             inv,
                         });
@@ -301,6 +317,7 @@ impl State {
                     row(CORES.iter().map(|&c| checkbox(self.cores.contains(c)).label(c).on_toggle(move |b| Msg::ToggleCore(c, b)).into())).spacing(16)
                 ),
                 labelled("Memory", radios(&[("modelled (real)", "real"), ("ideal (1-cycle)", "ideal")], self.memory, Msg::Memory)),
+                labelled("Main memory", pick_list(DramChoice::ALL, Some(self.dram), Msg::Dram).text_size(13)),
                 labelled("Spatz kernels", radios(&[("hand-written RVV", "tuned"), ("autovectorized", "autovec")], self.spatz_kernels, Msg::SpatzKernels)),
                 labelled("Timeout [s]", text_input("600", &self.timeout).on_input(Msg::Timeout).width(Length::Fixed(90.0))),
                 muted("ara is the CVA6 host with its Ara vector unit; each core runs the best code the pipeline has for it."),
@@ -311,6 +328,7 @@ impl State {
                 let any_kws = self.selected.iter().any(|a| ctx.ops.iter().any(|o| &o.arg == a && o.app.as_deref() == Some("kws")));
                 let mut c = column![
                     labelled("Host", radios(&[("CVA6", "cva6"), ("CVA6 + Ara", "ara")], self.host, Msg::Host)),
+                    labelled("Main memory", pick_list(DramChoice::ALL, Some(self.dram), Msg::Dram).text_size(13)),
                     labelled(
                         "Placement",
                         row(PLACEMENTS.iter().map(|&p| {
@@ -471,7 +489,13 @@ impl State {
                 text(format!(
                     "{} — {} memory, spatz {}",
                     r.op,
-                    if r.memory == "ideal" { "ideal" } else { "modelled" },
+                    if r.memory == "ideal" {
+                        "ideal".to_string()
+                    } else if r.dram.is_empty() || r.dram == "fixed" {
+                        "modelled".to_string()
+                    } else {
+                        DramChoice::from_arg(&r.dram).to_string()
+                    },
                     r.spatz_kernels
                 ))
                 .size(15)

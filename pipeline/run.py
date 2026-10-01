@@ -6,6 +6,7 @@ Usage:
   python pipeline/run.py /path/to/dir                               # dir with network.onnx + inputs.npz + outputs.npz
   python pipeline/run.py <op> --cores cva6,snitch,spatz
   python pipeline/run.py <op> --memory ideal                        # zero-latency memory instead of the modelled one
+  python pipeline/run.py <op> --dram lpddr4                         # a real RAM device as main memory
   python pipeline/run.py <op> --spatz-kernels autovec               # GCC's RVV instead of the hand-written kernels
   python pipeline/run.py <op> --debug                               # trace every command and the files it produced
                                                                     # (same as HES_DEBUG=1; trace goes to stderr)
@@ -20,6 +21,13 @@ targets above, which model cache misses, DRAM latency and refill bandwidth.
 `ideal` runs the zero-latency targets the first version of the pipeline used
 (cva6_ideal, snitch, spatz), where every access completes in a single cycle and
 cycle counts measure compute alone.
+
+--dram picks what main memory is under `real`: `fixed` (the default) charges a
+constant latency per access, while lpddr4, lpddr4x, lpddr5 and hyperram put a
+device model behind the caches -- banks, open rows, refresh and bus turnarounds,
+or the HyperBus latency -- so the cost depends on the access pattern
+(targets/hetero/dram_presets.py). It is a design choice, carried to the boards
+through HES_DESIGN like the rest (see targets/hetero/design.py).
 """
 
 import argparse
@@ -34,8 +42,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import (DEEPLOY_TEST, GENERIC_LIB, GVSOC, PYTHON, RESULTS, ROOT,  # noqa: E402
-                    RUNTIME, TARGETS, TC, WORK, dbg, note_file, set_debug, sh)
+from common import (DEEPLOY_TEST, DRAM_KINDS, DRAM_RE, GENERIC_LIB, GVSOC,  # noqa: E402
+                    PYTHON, RESULTS, ROOT, RUNTIME, TARGETS, TC, WORK, WRITEBACK_RE,
+                    dbg, dram_counters, note_file, set_debug, sh, use_dram)
 
 
 @dataclass
@@ -282,17 +291,25 @@ def simulate(core: Core, memory: str, elf: Path, run_dir: Path, timeout_s: int):
         "sim_wall_s": round(wall, 1),
     }
     caches = parse_caches(out)
+    for m in WRITEBACK_RE.finditer(out):
+        for c in caches:
+            if c["cache"] == m.group(1).split("/")[-1]:
+                c["writebacks"] = int(m.group(2))
     if caches:
         result["caches"] = caches
+    m = DRAM_RE.search(out)
+    if m:
+        result["dram"] = dram_counters(m)
     return result
 
 
 def report(op_name: str, memory: str, results: list[dict],
-           spatz_kernels: str = "tuned", out_path=None) -> None:
+           spatz_kernels: str = "tuned", out_path=None, dram: str = "fixed") -> None:
     ok = {r["core"]: r for r in results if "cycles" in r}
     base = ok.get("cva6")
 
     kern = "" if spatz_kernels == "tuned" else f", spatz kernels: {spatz_kernels}"
+    kern += "" if dram == "fixed" else f", main memory: {dram}"
     print(f"\n=== {op_name} — per-core performance "
           f"({MEMORY_MODELS[memory]}{kern}) ===\n")
     hdr = f"{'core':8} {'status':13} {'cycles':>12} {'instret':>10} {'speedup':>9}  {'maxdiff':>10}"
@@ -322,6 +339,23 @@ def report(op_name: str, memory: str, results: list[dict],
                       f"{rate:>9} {c['latency_cycles']:>10}")
         print()
 
+    if any(r.get("dram") for r in results):
+        # Whole run as well. Bursts are the device's unit of transfer (32 bytes
+        # on an x16 LPDDR, one transaction on HyperBus).
+        print(f"main memory ({dram}, whole run):\n")
+        hdr = (f"{'core':8} {'reads':>8} {'writes':>8} {'bursts':>8} {'row hit':>8} "
+               f"{'refresh':>8} {'busy us':>9} {'latency':>10}")
+        print(hdr)
+        print("-" * len(hdr))
+        for r in results:
+            d = r.get("dram")
+            if not d:
+                continue
+            rate = f"{100 * d['row_hit_rate']:.1f}%" if d["row_hit_rate"] is not None else "-"
+            print(f"{r['core']:8} {d['reads']:>8} {d['writes']:>8} {d['bursts']:>8} {rate:>8} "
+                  f"{d['refreshes']:>8} {d['busy_ns'] / 1000:>9.2f} {d['latency_cycles']:>10}")
+        print()
+
     if out_path is not None:
         # Somewhere of the caller's choosing -- a GUI run, or a --cores subset
         # that must not overwrite the committed all-cores results/<op>.json.
@@ -331,10 +365,14 @@ def report(op_name: str, memory: str, results: list[dict],
         RESULTS.mkdir(exist_ok=True)
         suffix = "" if memory == DEFAULT_MEMORY else f"-{memory}"
         suffix += "" if spatz_kernels == "tuned" else f"-spatz-{spatz_kernels}"
+        suffix += "" if dram == "fixed" else f"-{dram}"
         out = RESULTS / f"{op_name.replace('/', '_')}{suffix}.json"
-    out.write_text(json.dumps({"op": op_name, "memory": memory,
-                               "spatz_kernels": spatz_kernels,
-                               "results": results}, indent=2))
+    doc = {"op": op_name, "memory": memory, "spatz_kernels": spatz_kernels}
+    if dram != "fixed":
+        # Only when set, so a fixed-memory run writes exactly what it always did.
+        doc["dram"] = dram
+    doc["results"] = results
+    out.write_text(json.dumps(doc, indent=2))
     note_file(out, "per-core metrics")
     try:
         shown = out.resolve().relative_to(ROOT)
@@ -354,6 +392,10 @@ def main():
                     help="MatMul/GEMM kernels for spatz: the hand-written RVV ones "
                          "in runtime/spatz/kernels (default), or autovectorized "
                          "from the Deeploy Generic sources")
+    ap.add_argument("--dram", choices=list(DRAM_KINDS), default=None,
+                    help="main-memory device under --memory real: fixed latency, or a "
+                         "modelled LPDDR4/LPDDR4X/LPDDR5/HyperRAM (default: whatever "
+                         "HES_DESIGN selects, else fixed)")
     ap.add_argument("--timeout", type=int, default=600, help="per-sim timeout [s]")
     ap.add_argument("--out", default=None,
                     help="write the result JSON here instead of results/")
@@ -362,6 +404,11 @@ def main():
     args = ap.parse_args()
 
     set_debug(args.debug or os.environ.get("HES_DEBUG", "") not in ("", "0"))
+
+    dram = use_dram(args.dram)
+    if dram != "fixed" and args.memory != "real":
+        ap.error("--dram selects the main memory of the modelled memory system; "
+                 "it has no meaning with --memory ideal")
 
     if args.spatz_kernels == "tuned":
         for key, value in SPATZ_TUNED_KERNELS.items():
@@ -398,7 +445,7 @@ def main():
         results.append(simulate(core, args.memory, elf,
                                 work / cname / f"run-{args.memory}", args.timeout))
 
-    report(op_name, args.memory, results, args.spatz_kernels, out_path=args.out)
+    report(op_name, args.memory, results, args.spatz_kernels, out_path=args.out, dram=dram)
 
 
 if __name__ == "__main__":

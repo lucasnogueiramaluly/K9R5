@@ -19,7 +19,7 @@ from hetero.design import get as _d
 #
 # One clock domain for the whole SoC: a cycle difference between two engines
 # is a difference in work done per cycle, not in how they were clocked.
-FREQUENCY = _d('FREQUENCY', 10_000_000)
+FREQUENCY = memsys.FREQUENCY   # defined there: the DRAM timing depends on it
 
 # --- Main memory -----------------------------------------------------------
 #

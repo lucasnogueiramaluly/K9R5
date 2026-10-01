@@ -6,6 +6,10 @@ Split out of run.py unchanged so the per-core benchmark and the hetero_soc
 driver trace their runs the same way.
 """
 
+import hashlib
+import json
+import os
+import re
 import shlex
 import subprocess
 import sys
@@ -45,6 +49,77 @@ def detect_app(test_dir: Path):
         if (test_dir / app["header"]).is_file():
             return name, app
     return None, None
+
+
+# --- Main-memory device ------------------------------------------------------
+#
+# Which RAM main memory is (targets/hetero/memsys.py DRAM_KIND). It is a design
+# choice like any other, so it reaches the boards the way every design choice
+# does: through the HES_DESIGN file, which gvsoc and every generator this
+# process starts inherit. --dram writes that file.
+
+sys.path.insert(0, str(TARGETS))
+from hetero.dram_presets import KINDS as DRAM_KINDS  # noqa: E402
+
+
+def dram_kind() -> str:
+    """The main-memory device the current HES_DESIGN selects."""
+    path = os.environ.get("HES_DESIGN")
+    if not path:
+        return "fixed"
+    return json.loads(Path(path).read_text()).get("DRAM_KIND", "fixed")
+
+
+def use_dram(kind) -> str:
+    """Make every simulation this process starts use main-memory device `kind`.
+
+    Merges DRAM_KIND into the design already in HES_DESIGN (if any), writes the
+    result under work/designs/ and points HES_DESIGN at it. `kind` None leaves
+    the environment alone. Returns the effective kind either way.
+    """
+    if kind is None:
+        return dram_kind()
+    if kind not in DRAM_KINDS:
+        raise SystemExit(f"--dram {kind}: choose one of {', '.join(DRAM_KINDS)}")
+    base = os.environ.get("HES_DESIGN")
+    design = json.loads(Path(base).read_text()) if base else {}
+    if kind == "fixed" and "DRAM_KIND" not in design:
+        return kind
+    design["DRAM_KIND"] = kind
+    text = json.dumps(design, indent=2, sort_keys=True) + "\n"
+    out = WORK / "designs" / f"dram-{kind}-{hashlib.sha1(text.encode()).hexdigest()[:8]}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text)
+    # Absolute: gvsoc runs from the run directory, not from here.
+    os.environ["HES_DESIGN"] = str(out.resolve())
+    return kind
+
+
+DRAM_RE = re.compile(r"\[HES-DRAM\] mem=(\S+) kind=(\S+) reads=(\d+) writes=(\d+) "
+                     r"bursts=(\d+) row_hits=(\d+) row_misses=(\d+) row_conflicts=(\d+) "
+                     r"refreshes=(\d+) busy_ns=(\S+) latency_cycles=(\d+)")
+WRITEBACK_RE = re.compile(r"\[HES-MEM\] cache=(\S+) writebacks=(\d+)")
+
+
+def dram_counters(m) -> dict:
+    """One [HES-DRAM] match (DRAM_RE) as a dict."""
+    hits, misses, conflicts = int(m.group(6)), int(m.group(7)), int(m.group(8))
+    bursts = hits + misses + conflicts
+    return {
+        "mem": m.group(1),
+        "kind": m.group(2),
+        "reads": int(m.group(3)),
+        "writes": int(m.group(4)),
+        "bursts": int(m.group(5)),
+        "row_hits": hits,
+        "row_misses": misses,
+        "row_conflicts": conflicts,
+        # Bursts that found their row open; None for a device without rows.
+        "row_hit_rate": round(hits / bursts, 4) if bursts else None,
+        "refreshes": int(m.group(9)),
+        "busy_ns": float(m.group(10)),
+        "latency_cycles": int(m.group(11)),
+    }
 
 
 DEBUG = False
