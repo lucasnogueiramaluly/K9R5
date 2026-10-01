@@ -309,7 +309,9 @@ mod tests {
         assert_eq!(l.program, "docker");
         let a = l.args.join("\n");
         for d in DATA_DIRS {
-            assert!(a.contains(&format!("type=bind,source=/home/me/my ws/{d},target=/workspace/{d}")), "{a}");
+            // The source is joined with the host's separator (`\` on Windows).
+            let src = PathBuf::from("/home/me/my ws").join(d);
+            assert!(a.contains(&format!("type=bind,source={},target=/workspace/{d}", src.display())), "{a}");
         }
         assert!(!a.contains("target=/workspace/pipeline"));
         let img = l.args.iter().position(|x| x == "hetero-sim:gui").unwrap();
