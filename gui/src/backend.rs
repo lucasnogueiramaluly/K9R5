@@ -195,11 +195,37 @@ pub async fn capture(settings: Settings, inv: Invocation) -> Result<String, Stri
         {
             return Err(e.to_string());
         }
+        if let Some(hint) = explain_missing_script(&settings, &stderr) {
+            return Err(hint);
+        }
         let tail: String =
             stderr.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
         return Err(format!("{} exited with {}\n{tail}", inv.script, out.status));
     }
     Ok(stdout)
+}
+
+/// Python's "can't open file" for a pipeline script, turned into what to do.
+///
+/// Under Docker it almost always means the image is older than the checkout:
+/// only ops/, results/ and work/ are mounted, so the scripts come from the
+/// image, and one built before the GUI helpers (or before a script was added)
+/// does not have them.
+pub fn explain_missing_script(settings: &Settings, output: &str) -> Option<String> {
+    let line = output.lines().find(|l| l.contains("can't open file") && l.contains("pipeline/"))?;
+    let script = line.split("open file '").nth(1).and_then(|r| r.split('\'').next()).unwrap_or("the script");
+    Some(match settings.backend {
+        BackendKind::Docker => format!(
+            "The Docker image \"{img}\" has no {script}: it is older than this checkout. \
+             Rebuild it (docker build -t {img} . in the workspace), choose a newer image in Settings, \
+             or tick \"Mount pipeline/, runtime/ and targets/\" there.",
+            img = settings.docker_image
+        ),
+        BackendKind::Native => format!(
+            "{script} does not exist in the workspace {}: point Settings at an up-to-date checkout.",
+            settings.workspace.display()
+        ),
+    })
 }
 
 fn next_query_id() -> u64 {
@@ -274,11 +300,7 @@ pub async fn check(settings: Settings) -> Vec<(String, Result<String, String>)> 
                 )),
                 Err(err) => Err(format!("unexpected answer: {err}")),
             },
-            Err(e) => Err(if e.contains("gui_query.py") && e.contains("No such file") {
-                format!("{e}\nThe image predates the GUI helpers: rebuild it, or enable \"mount sources\".")
-            } else {
-                e
-            }),
+            Err(e) => Err(e),
         },
     ));
     out
@@ -335,6 +357,17 @@ mod tests {
         // Path::join uses the host separator, so only check the prefix survives
         // unmangled (no -v colon splitting to worry about with --mount).
         assert!(a.contains(r"type=bind,source=C:\Users\me\hetero-sim"), "{a}");
+    }
+
+    #[test]
+    fn missing_script_in_an_old_image_says_what_to_do() {
+        let mut s = settings(BackendKind::Docker, "/w");
+        s.docker_image = "hetero-sim".into();
+        let err = "python: can't open file '/workspace/pipeline/gui_query.py': [Errno 2] No such file or directory";
+        let hint = explain_missing_script(&s, err).unwrap();
+        assert!(hint.contains("\"hetero-sim\" has no /workspace/pipeline/gui_query.py"), "{hint}");
+        assert!(hint.contains("docker build -t hetero-sim ."));
+        assert!(explain_missing_script(&s, "Traceback: KeyError").is_none());
     }
 
     #[test]
