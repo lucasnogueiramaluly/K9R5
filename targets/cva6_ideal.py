@@ -17,6 +17,8 @@ from elftools.elf.elffile import *
 import gvsoc.runner as gvsoc
 from pulp.stdout.stdout_v3 import Stdout
 
+from hetero import memsys
+
 
 class Soc(st.Component):
 
@@ -63,7 +65,7 @@ class Cva6IdealChip(st.Component):
 
         super(Cva6IdealChip, self).__init__(parent, name, options=options)
 
-        clock = Clock_domain(self, 'clock', frequency=10000000)
+        clock = Clock_domain(self, 'clock', frequency=memsys.FREQUENCY)
 
         soc = Soc(self, 'soc', parser)
 

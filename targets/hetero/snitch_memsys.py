@@ -11,7 +11,8 @@
 # place the Spatz simulation has no memory delay at all.
 #
 # Rather than fork the ~90-line Soc to change one argument, the mapping is
-# retuned on the built tree, before the configuration is generated.
+# retuned on the built tree, before the configuration is generated. A real
+# main-memory device (memsys.DRAM_KIND) is spliced in the same way.
 #
 
 from pulp.chips.snitch.snitch import SnitchBoard
@@ -42,13 +43,43 @@ def retune_hbm(board, latency: int):
     hbm[0]['latency'] = latency
 
 
+def insert_dram(board):
+    """Put the main-memory device between `board`'s chip and its HBM.
+
+    The stock board binds chip.hbm straight to the memory; that binding is
+    rewired to chip.hbm -> device -> memory. The board clock is also moved to
+    memsys.FREQUENCY: GVSoC hardcodes 10 MHz there, at which a device timed in
+    nanoseconds would cost a single cycle per access.
+    """
+    dram_ctrl = memsys.make_main_memory(board)
+    mem = board.get_component('mem')
+    chip = board.get_component('chip')
+
+    hbm = [b for b in board.bindings
+           if b[0] is chip and b[1] == 'hbm' and b[2] is mem and b[3] == 'input']
+    if len(hbm) != 1:
+        raise RuntimeError(
+            "expected exactly one chip.hbm -> mem.input binding on the Snitch board, "
+            f"found {len(hbm)} -- the GVSoC Snitch board layout changed")
+    hbm[0][2] = dram_ctrl
+    board.bind(dram_ctrl, 'output', mem, 'input')
+    board.bind(board.get_component('clock'), 'out', dram_ctrl, 'clock')
+
+    board.get_component('clock').add_properties({'frequency': memsys.FREQUENCY})
+
+
 class SnitchRealBoard(SnitchBoard):
-    """Snitch board whose HBM answers at the memory system's DRAM latency."""
+    """Snitch board whose HBM answers at the memory system's DRAM latency, or
+    through the main-memory device when memsys.DRAM_KIND names one."""
 
     def __init__(self, parent, name: str, parser, options, spatz=False):
         super().__init__(parent, name, parser, options, spatz=spatz)
 
-        retune_hbm(self, memsys.DRAM_LATENCY)
+        if memsys.DRAM_KIND == 'fixed':
+            retune_hbm(self, memsys.DRAM_LATENCY)
+        else:
+            retune_hbm(self, 0)
+            insert_dram(self)
 
 
 class SpatzRealBoard(SnitchRealBoard):

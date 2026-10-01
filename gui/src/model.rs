@@ -125,6 +125,9 @@ pub struct IsolatedResult {
     pub memory: String,
     #[serde(default)]
     pub spatz_kernels: String,
+    /// Main-memory device (`--dram`); absent for the fixed-latency model.
+    #[serde(default)]
+    pub dram: String,
     pub results: Vec<CoreResult>,
 }
 

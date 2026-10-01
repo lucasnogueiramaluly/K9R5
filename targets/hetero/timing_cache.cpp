@@ -29,6 +29,23 @@
  * and the next level indexes the same line either way, so a chain of these
  * caches agrees on what is resident even though no line-sized request is ever
  * issued.
+ *
+ * Write-back mode (the 'writeback' property, used for the L2 when main memory
+ * is a real device -- hetero/dram.cpp): the next level must then see the
+ * traffic a write-back cache really sends it, and nothing else.
+ *   read hit    forwarded as a debug access, as above.
+ *   read miss   forwarded as is: the request is the refill.
+ *   write hit   forwarded as a debug access (the data still has to land in
+ *               memory, since no level holds any), and the line turns dirty.
+ *   write miss  the same, plus a timed read of the line(s): write-allocate
+ *               refills before it writes.
+ *   eviction    of a dirty line: the line is read back through the debug path
+ *               and written again as a real access. Memory already holds those
+ *               bytes, so the write changes nothing functionally; what it adds
+ *               is the write burst the next level would have had to absorb.
+ *               Its latency is not charged to the master -- the victim goes
+ *               to a write buffer -- but it occupies the next level, which
+ *               delays whatever comes after it.
  */
 
 #include <vp/vp.hpp>
@@ -72,6 +89,13 @@ public:
 
 private:
     static vp::IoReqStatus req(vp::Block *__this, vp::IoReq *req);
+    vp::IoReqStatus req_writeback(vp::IoReq *req);
+    // Write-back mode: timed refill of the lines [addr, addr + size) touch,
+    // returning the latency the next level reported.
+    int64_t timed_fill(uint64_t addr, uint64_t size);
+    // Write-back mode: write the dirty victims collected by lookup() back.
+    void flush_victims();
+    void mark_dirty(uint64_t line);
 
     // True if every line the access touches is already resident. Changes no
     // state: it runs before the request is forwarded, to decide whether the
@@ -106,7 +130,14 @@ private:
     int64_t write_cycles;
     int64_t store_buffer_cycles;  // depth of the store buffer, as drain cycles
     bool write_allocate;
+    bool writeback;
     bool stats;
+
+    // Write-back mode only.
+    std::vector<uint8_t> dirty;       // per way, like tags
+    std::vector<uint64_t> victims;    // dirty lines evicted by the current access
+    vp::IoReq side_req;               // refills and write-backs the cache issues itself
+    std::vector<uint8_t> side_data;
 
     // Tag array. Every vector is indexed by set * nb_ways + way.
     std::vector<uint64_t> tags;
@@ -140,6 +171,7 @@ private:
     uint64_t nb_hit;
     uint64_t nb_miss;
     uint64_t nb_latency_cycles;
+    uint64_t nb_writeback;
 };
 
 // The component behind the output port, if it offers a backdoor. The cache
@@ -205,6 +237,7 @@ TimingCache::TimingCache(vp::ComponentConf &config)
     this->refill_cycles = this->get_js_config()->get_child_int("refill_cycles");
     this->write_cycles = this->get_js_config()->get_child_int("write_cycles");
     this->write_allocate = this->get_js_config()->get_child_bool("write_allocate");
+    this->writeback = this->get_js_config()->get_child_bool("writeback");
     this->stats = this->get_js_config()->get_child_bool("stats");
 
     // Unset in the config, new_power_source leaves the source contributing
@@ -245,6 +278,17 @@ TimingCache::TimingCache(vp::ComponentConf &config)
     this->tags.resize(this->nb_sets * this->nb_ways);
     this->lru.resize(this->nb_sets * this->nb_ways);
     this->line_ready.resize(this->nb_sets * this->nb_ways);
+
+    // A write-back cache that does not allocate on a write miss would have to
+    // forward the store as a real access, which this model does not do.
+    if (this->writeback)
+    {
+        if (!this->write_allocate)
+        {
+            this->trace.fatal("writeback requires write_allocate\n");
+        }
+        this->dirty.resize(this->nb_sets * this->nb_ways);
+    }
 }
 
 void TimingCache::reset(bool active)
@@ -261,6 +305,9 @@ void TimingCache::reset(bool active)
         this->nb_hit = 0;
         this->nb_miss = 0;
         this->nb_latency_cycles = 0;
+        this->nb_writeback = 0;
+        std::fill(this->dirty.begin(), this->dirty.end(), 0);
+        this->victims.clear();
 
         this->background_power.leakage_power_start();
         this->background_power.dynamic_power_start();
@@ -302,6 +349,16 @@ int64_t TimingCache::lookup(uint64_t line, bool allocate, int64_t ready_time)
             oldest = this->lru[set * this->nb_ways + way];
             victim = way;
         }
+    }
+
+    if (this->writeback && set_tags[victim] != LINE_INVALID &&
+        this->dirty[set * this->nb_ways + victim])
+    {
+        this->victims.push_back(set_tags[victim]);
+    }
+    if (this->writeback)
+    {
+        this->dirty[set * this->nb_ways + victim] = 0;
     }
 
     set_tags[victim] = line;
@@ -418,7 +475,15 @@ int64_t TimingCache::access(uint64_t addr, uint64_t size, bool is_write,
         ready = std::max(ready, refill_done);
     }
 
-    if (is_write)
+    if (is_write && this->writeback)
+    {
+        // Write-back: the store stays here, in a line that is now resident.
+        for (uint64_t line = first_line; line <= last_line; line++)
+        {
+            this->mark_dirty(line);
+        }
+    }
+    else if (is_write)
     {
         // Write-through: the store is handed to the store buffer, which drains
         // it to the next level. The master stalls only for the part of the
@@ -439,9 +504,144 @@ int64_t TimingCache::access(uint64_t addr, uint64_t size, bool is_write,
     return latency;
 }
 
+void TimingCache::mark_dirty(uint64_t line)
+{
+    int set = (int)(line & this->set_mask);
+    for (int way = 0; way < this->nb_ways; way++)
+    {
+        if (this->tags[set * this->nb_ways + way] == line)
+        {
+            this->dirty[set * this->nb_ways + way] = 1;
+            return;
+        }
+    }
+}
+
+int64_t TimingCache::timed_fill(uint64_t addr, uint64_t size)
+{
+    uint64_t first = (addr >> this->line_bits) << this->line_bits;
+    uint64_t last = ((addr + (size ? size : 1) - 1) >> this->line_bits) << this->line_bits;
+    uint64_t bytes = last - first + (1ULL << this->line_bits);
+
+    this->side_data.resize(bytes);
+    this->side_req.init();
+    this->side_req.set_addr(first);
+    this->side_req.set_size(bytes);
+    this->side_req.set_is_write(false);
+    this->side_req.set_data(this->side_data.data());
+
+    vp::IoReqStatus status = this->output_itf.req(&this->side_req);
+    if (status != vp::IO_REQ_OK)
+    {
+        this->trace.fatal("Write-back refill needs a synchronous next level (status %d)\n", status);
+    }
+    return (int64_t)this->side_req.get_latency();
+}
+
+void TimingCache::flush_victims()
+{
+    uint64_t line_size = 1ULL << this->line_bits;
+    this->side_data.resize(line_size);
+
+    for (uint64_t line : this->victims)
+    {
+        uint64_t addr = line << this->line_bits;
+
+        // Fetch what memory holds for the line (untimed), then write it back
+        // as a real access: same bytes, so only the timing changes.
+        this->side_req.init();
+        this->side_req.set_addr(addr);
+        this->side_req.set_size(line_size);
+        this->side_req.set_is_write(false);
+        this->side_req.set_data(this->side_data.data());
+        this->side_req.set_debug(true);
+        vp::IoReqStatus status = this->output_itf.req(&this->side_req);
+
+        if (status == vp::IO_REQ_OK)
+        {
+            this->side_req.init();
+            this->side_req.set_addr(addr);
+            this->side_req.set_size(line_size);
+            this->side_req.set_is_write(true);
+            this->side_req.set_data(this->side_data.data());
+            status = this->output_itf.req(&this->side_req);
+        }
+        if (status != vp::IO_REQ_OK)
+        {
+            this->trace.fatal("Write-back of line 0x%llx failed (status %d)\n",
+                              (unsigned long long)addr, status);
+        }
+
+        this->nb_writeback++;
+        if (this->power.is_enabled())
+        {
+            this->refill_power.account_energy_quantum();
+        }
+    }
+    this->victims.clear();
+}
+
+vp::IoReqStatus TimingCache::req_writeback(vp::IoReq *req)
+{
+    uint64_t addr = req->get_addr();
+    uint64_t size = req->get_size();
+    bool is_write = req->get_is_write();
+
+    // Debug accesses pass straight through, untimed, as in the default mode.
+    if (req->is_debug())
+    {
+        return this->output_itf.req_forward(req);
+    }
+
+    // Only a read miss goes down as a real access; everything else moves its
+    // bytes through the debug path. See the header comment.
+    bool resident = this->probe(addr, size);
+    bool is_refill = !resident && !is_write;
+
+    if (!is_refill)
+    {
+        req->set_debug(true);
+    }
+    vp::IoReqStatus status = this->output_itf.req_forward(req);
+    if (!is_refill)
+    {
+        req->set_debug(false);
+    }
+
+    if (status == vp::IO_REQ_INVALID)
+    {
+        return status;
+    }
+    if (status != vp::IO_REQ_OK)
+    {
+        this->trace.fatal("Write-back mode needs a synchronous next level (status %d)\n", status);
+    }
+
+    int64_t next_level_latency = 0;
+    if (is_refill)
+    {
+        next_level_latency = (int64_t)req->get_latency();
+    }
+    else if (!resident)
+    {
+        next_level_latency = this->timed_fill(addr, size);
+    }
+
+    int64_t latency = this->access(addr, size, is_write, next_level_latency);
+    this->flush_victims();
+
+    req->set_exact_latency(latency);
+    return vp::IO_REQ_OK;
+}
+
 vp::IoReqStatus TimingCache::req(vp::Block *__this, vp::IoReq *req)
 {
     TimingCache *_this = (TimingCache *)__this;
+
+    if (_this->writeback)
+    {
+        return _this->req_writeback(req);
+    }
 
     uint64_t addr = req->get_addr();
     uint64_t size = req->get_size();
@@ -529,6 +729,13 @@ void TimingCache::stop()
                (unsigned long long)this->nb_read, (unsigned long long)this->nb_write,
                (unsigned long long)this->nb_hit, (unsigned long long)this->nb_miss,
                (unsigned long long)this->nb_latency_cycles, dynamic_pj, leakage_pj);
+        if (this->writeback)
+        {
+            // A line of its own: the counter parsers require accesses= and so
+            // skip it, while pipeline/run.py picks it up separately.
+            printf("[HES-MEM] cache=%s writebacks=%llu\n", this->get_path().c_str(),
+                   (unsigned long long)this->nb_writeback);
+        }
         fflush(stdout);
     }
 }

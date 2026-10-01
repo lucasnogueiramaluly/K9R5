@@ -47,6 +47,7 @@ pub enum Msg {
     Power(bool),
     Frontend(FrontendChoice),
     Serial(bool),
+    Dram(DramChoice),
     Mode(SpaceMode),
     Values(String, String),
     LoadOfat,
@@ -150,6 +151,10 @@ impl State {
             }
             Msg::Power(b) => {
                 self.spec.power = b;
+                Out::none()
+            }
+            Msg::Dram(d) => {
+                self.spec.dram = d.arg().into();
                 Out::none()
             }
             Msg::Frontend(f) => {
@@ -369,6 +374,10 @@ impl State {
                 text_input("16", &s.images.to_string()).on_input(Msg::Images).width(Length::Fixed(90.0))
             ),
             labelled("", checkbox(s.power).label("Measure energy (--power, slower)").on_toggle(Msg::Power)),
+            labelled(
+                "Main memory",
+                pick_list(DramChoice::ALL, Some(DramChoice::from_arg(&s.dram)), Msg::Dram).text_size(13)
+            ),
         ]
         .spacing(8);
         if any_kws {

@@ -37,6 +37,10 @@ class TimingCache(gvsoc.systree.Component):
     store_buffer_size: int
         Number of stores the write buffer holds. The master stalls on a store
         only once the buffer is full.
+    writeback: bool
+        True for a write-back cache: only refills and dirty evictions reach the
+        next level as real accesses (see timing_cache.cpp). Requires
+        write_allocate.
     stats: bool
         True to print a [HES-MEM] counters line at the end of the simulation.
     """
@@ -45,7 +49,7 @@ class TimingCache(gvsoc.systree.Component):
             line_size: int = 64, ways: int = 4, hit_latency: int = 1,
             miss_latency: int = 0, refill_cycles: int = 1, write_cycles: int = 1,
             write_allocate: bool = False, store_buffer_size: int = 0,
-            stats: bool = False):
+            writeback: bool = False, stats: bool = False):
 
         super().__init__(parent, name)
 
@@ -61,6 +65,7 @@ class TimingCache(gvsoc.systree.Component):
             'write_cycles': write_cycles,
             'write_allocate': write_allocate,
             'store_buffer_size': store_buffer_size,
+            'writeback': writeback,
             'stats': stats,
         })
 

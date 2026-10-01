@@ -35,8 +35,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import build_mesh  # noqa: E402
 from build_mesh import HOSTS, build_network  # noqa: E402
-from common import (APPS, GVSOC, PYTHON, RESULTS, ROOT, TARGETS, WORK,  # noqa: E402
-                    detect_app, note_file, set_debug)
+from common import (APPS, DRAM_KINDS, DRAM_RE, GVSOC, PYTHON, RESULTS, ROOT,  # noqa: E402
+                    TARGETS, WORK, WRITEBACK_RE, detect_app, dram_counters, note_file,
+                    set_debug, use_dram)
 
 DEEPLOY_TEST = ROOT / "deps" / "deeploy" / "DeeployTest"
 
@@ -173,6 +174,7 @@ def simulate(elfs: dict, run_dir: Path, total_nodes: int, timeout_s: int,
 
     prog = Progress(total_nodes, quiet)
     lines, result, caches = [], None, []
+    drams, writebacks = [], {}
     mnist_result = None
     kws_result = None
     stalled = False
@@ -219,6 +221,14 @@ def simulate(elfs: dict, run_dir: Path, total_nodes: int, timeout_s: int,
             m = MEM_RE.search(line)
             if m:
                 caches.append(m)
+                continue
+            m = DRAM_RE.search(line)
+            if m:
+                drams.append(m)
+                continue
+            m = WRITEBACK_RE.search(line)
+            if m:
+                writebacks[m.group(1).split("/")[-1]] = int(m.group(2))
                 continue
             if line.strip():
                 if not quiet:
@@ -312,6 +322,11 @@ def simulate(elfs: dict, run_dir: Path, total_nodes: int, timeout_s: int,
             "dynamic_pj": float(m.group(8)) if m.group(8) else None,
             "leakage_pj": float(m.group(9)) if m.group(9) else None,
         } for m in caches]
+        for c in out["caches"]:
+            if c["cache"] in writebacks:
+                c["writebacks"] = writebacks[c["cache"]]
+    if drams:
+        out["dram"] = dram_counters(drams[-1])
     return out
 
 
@@ -379,6 +394,12 @@ def report(op_name: str, mapping: dict, res: dict, out_path = None) -> None:
         print(f"status   {res['status']}")
         for line in res.get("log_tail", []):
             print(f"  | {line}")
+    if res.get("dram"):
+        d = res["dram"]
+        rate = f"{100 * d['row_hit_rate']:.1f}%" if d["row_hit_rate"] is not None else "-"
+        print(f"memory   {d['kind']}: {d['reads']} reads, {d['writes']} writes, "
+              f"{d['bursts']} bursts, row hits {rate}, {d['refreshes']} refreshes, "
+              f"bus busy {d['busy_ns'] / 1000:.1f} us")
     print(f"wall     {res['wall_s']}s"
           + (f"   (pinned to {mapping['pin']})" if mapping.get("pin") else ""))
 
@@ -395,6 +416,8 @@ def report(op_name: str, mapping: dict, res: dict, out_path = None) -> None:
             suffix += f"-fe-{mapping['frontend']}"
         if mapping.get("serial"):
             suffix += "-serial"
+        if mapping.get("dram", "fixed") != "fixed":
+            suffix += f"-{mapping['dram']}"
         out = RESULTS / f"{op_name.replace('/', '_')}-hetero{suffix}.json"
     out.write_text(json.dumps({"op": op_name, "mapping": mapping, "result": res},
                               indent = 2))
@@ -437,6 +460,10 @@ def main():
                            "of overlapping it -- the same work with the two "
                            "clusters taking turns, which is the baseline the "
                            "pipelined run is measured against")
+    ap.add_argument("--dram", choices = list(DRAM_KINDS), default = None,
+                    help = "main-memory device: fixed latency, or a modelled "
+                           "LPDDR4/LPDDR4X/LPDDR5/HyperRAM (default: whatever "
+                           "HES_DESIGN selects, else fixed)")
     ap.add_argument("--timeout", type = int, default = 3600, help = "wall limit [s]")
     ap.add_argument("--stall-timeout", type = int, default = 180,
                     help = "declare a stall after this long with no beacon [s]")
@@ -446,6 +473,9 @@ def main():
     args = ap.parse_args()
 
     set_debug(args.debug or os.environ.get("HES_DEBUG", "") not in ("", "0"))
+    # Before anything that reads the design: the mapper's cost model and the
+    # board both have to see the same main memory.
+    dram = use_dram(args.dram)
 
     test_dir = resolve_op(args.op)
     try:
@@ -459,6 +489,8 @@ def main():
     variant = f"{args.host}-{args.pin or 'mapped'}"
     if (test_dir / "kws_data.h").is_file():
         variant += f"-fe{args.frontend}" + ("-serial" if args.serial else "")
+    if dram != "fixed":
+        variant += f"-{dram}"
     if args.tag:
         variant += f"-{args.tag}"
     work = WORK / f"hetero_{op_name}" / variant
@@ -467,6 +499,8 @@ def main():
     print(f"[1/3] Deeploy: {test_dir.name}/network.onnx -> C, mapped across engines")
     mapping = generate(test_dir, gen_dir, args.pin, args.debug, args.host)
     mapping["host"] = args.host
+    if dram != "fixed":
+        mapping["dram"] = dram
 
     print(f"[2/3] build: {args.host} host + snitch cluster + spatz cluster")
     app_name, app = detect_app(test_dir)
