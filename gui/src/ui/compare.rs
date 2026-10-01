@@ -261,7 +261,8 @@ impl State {
                         let out = format!("{run}/{tag}.json");
                         inv = inv.arg("--out").arg(out.clone());
                         let place = if p == "mapped" { "mapped".to_string() } else { format!("pinned to {p}") };
-                        let mem = if self.dram == DramChoice::Fixed { String::new() } else { format!(", {}", self.dram) };
+                        let mem =
+                            if self.dram == DramChoice::Fixed { String::new() } else { format!(", {}", self.dram) };
                         jobs.push(NewJob {
                             title: format!("{op} on the SoC, {} host, {place}{mem}", self.host),
                             kind: JobKind::Run { out },
