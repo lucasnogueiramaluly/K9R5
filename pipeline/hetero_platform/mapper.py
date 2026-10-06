@@ -41,7 +41,7 @@ import onnx_graphsurgeon as gs
 from Deeploy.DeeployTypes import DeploymentEngine
 from Deeploy.EngineExtension.OptimizationPasses.TopologyOptimizationPasses.EngineColoringPasses import EngineMapper
 
-from .engines import ClusterEngine, working_set_bytes
+from .engines import ClusterEngine, _all_fp32, working_set_bytes
 
 try:  # Pipeline scripts import hetero_platform as a top-level package.
     from experiment.matmul_gemm_implementation import resolve_matmul_gemm_implementation
@@ -86,6 +86,11 @@ OFFLOAD_FIXED = {"cva6": 0, "snitch": 1200, "spatz": 1200}
 # Cycles per byte staged into TCDM and back, from the same measurements.
 OFFLOAD_PER_BYTE = {"cva6": 0.0, "snitch": 0.10, "spatz": 0.10}
 
+RATE_TABLE_SOURCE = {
+    "kind": "committed_rate_table",
+    "path": "pipeline/hetero_platform/mapper.py",
+}
+
 
 # A design-space sweep changes the very hardware these numbers measure, so a
 # swept design would otherwise be mapped by another machine's arithmetic -- a
@@ -96,6 +101,7 @@ OFFLOAD_PER_BYTE = {"cva6": 0.0, "snitch": 0.10, "spatz": 0.10}
 # Unset, the committed tables above are used unchanged, so nothing about the
 # existing pipeline moves.
 def _load_measured_tables() -> None:
+    global RATE_TABLE_SOURCE
     path = os.environ.get("HES_RATES")
     if not path:
         return
@@ -126,6 +132,10 @@ def _load_measured_tables() -> None:
     for name, table in active:
         table.clear()
         table.update(replacements[name])
+    RATE_TABLE_SOURCE = {
+        "kind": "external_rate_table",
+        "path": str(Path(path)),
+    }
 
 
 _load_measured_tables()
@@ -237,6 +247,7 @@ class CostEngineMapper(EngineMapper):
         self.pin = pin
         self.host = host
         self.decisions = []  #: (node name, op, engine, cost) for the report
+        self.explanations = []  #: descriptive shadows of completed decisions
 
     def cost_breakdown(self, engine: DeploymentEngine, node: gs.Node) -> dict:
         """Return a defensible numeric cost or an explicit unavailable reason."""
@@ -258,11 +269,18 @@ class CostEngineMapper(EngineMapper):
         if engine.name == "cva6":
             rates = RATES.get(self.host)
             missing_row = "missing_host_rate_row"
+            rate_row = {"kind": "host_profile", "key": self.host}
         else:
             rates = RATES.get(engine.name)
             missing_row = "missing_engine_rate_row"
+            rate_row = {"kind": "engine", "key": engine.name}
         if not isinstance(rates, dict):
-            return {"evaluated": False, "reason": missing_row}
+            return {
+                "evaluated": False,
+                "reason": missing_row,
+                "rate_row": rate_row,
+                "rate_table": dict(RATE_TABLE_SOURCE),
+            }
 
         if node.op in rates:
             rate_key = node.op
@@ -285,6 +303,8 @@ class CostEngineMapper(EngineMapper):
                 "reason": "missing_or_invalid_operator_rate",
                 "rate_key": rate_key,
                 "rate_kind": rate_kind,
+                "rate_row": rate_row,
+                "rate_table": dict(RATE_TABLE_SOURCE),
             }
 
         macs = node_macs(node)
@@ -323,12 +343,131 @@ class CostEngineMapper(EngineMapper):
             "rate_macs_per_cycle": rate,
             "rate_key": rate_key,
             "rate_kind": rate_kind,
+            "rate_row": rate_row,
+            "rate_table": dict(RATE_TABLE_SOURCE),
             "fixed_offload_cycles": fixed,
             "working_set_bytes": staged_bytes,
             "per_byte_offload_cycles": per_byte if staged_bytes is not None else None,
             "transfer_offload_cycles": transfer if staged_bytes is not None else None,
             "total_estimated_cycles": total,
         }
+
+    @staticmethod
+    def _incompatibility_reason(engine: DeploymentEngine, node: gs.Node) -> str:
+        """Explain a failed current canExecute check without changing it."""
+        if isinstance(engine, ClusterEngine):
+            if not engine.enabled:
+                return "cluster_disabled"
+            if node.op not in engine.Mapping:
+                return "operator_not_in_cluster_mapping"
+            if not _all_fp32(node):
+                return "node_not_fp32"
+            staged_bytes = working_set_bytes(node)
+            if staged_bytes is None:
+                return "working_set_bytes_unavailable"
+            if staged_bytes > engine.tcdm_budget:
+                return "working_set_exceeds_tcdm_budget"
+        if node.op not in engine.Mapping:
+            return "operator_not_in_engine_mapping"
+        return "compatibility_reason_unknown"
+
+    def _record_explanation(
+        self,
+        node: gs.Node,
+        candidates,
+        selected,
+        selected_cost,
+        *,
+        pin_selected: bool,
+        cost_details: dict | None = None,
+    ) -> None:
+        """Record descriptive state after a selection decision has been made."""
+        cost_details = cost_details or {}
+        entries = []
+        for engine in self.engineDict.values():
+            compatible = engine in candidates
+            retained = compatible and (
+                not pin_selected or engine.name == self.pin
+            )
+            incompatibility_reason = (
+                None if compatible else self._incompatibility_reason(engine, node)
+            )
+            if compatible:
+                cost = cost_details.get(engine.name)
+                if cost is None:
+                    try:
+                        cost = self.cost_breakdown(engine, node)
+                    except Exception as error:
+                        # Explanation collection must never change compatible
+                        # pin behavior merely because an unused cost cannot be
+                        # described. Automatic selection still evaluates costs
+                        # through the unchanged fail-loud path above.
+                        cost = {
+                            "evaluated": False,
+                            "reason": "cost_breakdown_error_during_observation",
+                            "error_type": type(error).__name__,
+                        }
+            else:
+                cost = {
+                    "evaluated": False,
+                    "reason": "engine_incompatible",
+                }
+
+            if not compatible:
+                pin_influence = (
+                    "pinned_engine_incompatible"
+                    if engine.name == self.pin
+                    else "incompatible_before_pin"
+                )
+            elif self.pin is None:
+                pin_influence = "not_requested"
+            elif pin_selected and engine.name == self.pin:
+                pin_influence = "retained_by_pin"
+            elif pin_selected:
+                pin_influence = "excluded_by_compatible_pin"
+            else:
+                pin_influence = "pin_not_applied"
+
+            entries.append({
+                "engine": engine.name,
+                "compatible": compatible,
+                "candidate_before_pin": compatible,
+                "candidate_after_pin": retained,
+                "incompatibility_reason": incompatibility_reason,
+                "exclusion_reason": (
+                    incompatibility_reason
+                    if not compatible
+                    else "excluded_by_compatible_pin" if not retained else None
+                ),
+                "pin_influence": pin_influence,
+                "cost": cost,
+                "cost_used_for_selection": (
+                    selected is engine and not pin_selected and selected_cost is not None
+                ),
+            })
+
+        if selected is None:
+            selection_rule = (
+                "compatible_engines_without_safe_automatic_cost"
+                if candidates
+                else "no_compatible_engine"
+            )
+        elif pin_selected:
+            selection_rule = "compatible_pinned_engine_selected"
+        else:
+            selection_rule = "minimum_safe_estimated_cost"
+
+        self.explanations.append({
+            "strategy": "measured_rate_greedy",
+            "node": node.name,
+            "operator": node.op,
+            "requested_pin": self.pin,
+            "pin_semantics": "compatible_node_preference_not_whole_graph",
+            "engines": entries,
+            "selected_engine": selected.name if selected is not None else None,
+            "selected_estimated_cost_cycles": selected_cost,
+            "selection_rule": selection_rule,
+        })
 
     def cost(self, engine: DeploymentEngine, node: gs.Node) -> float | None:
         breakdown = self.cost_breakdown(engine, node)
@@ -338,24 +477,48 @@ class CostEngineMapper(EngineMapper):
         _ = graph
         candidates = [e for e in self.engineDict.values() if e.canExecute(node)]
         if not candidates:
+            self._record_explanation(
+                node, candidates, None, None, pin_selected=False,
+            )
             return None
 
         if self.pin is not None:
             pinned = self.engineDict.get(self.pin)
             if pinned is not None and pinned in candidates:
                 self.decisions.append((node.name, node.op, pinned.name, None))
+                self._record_explanation(
+                    node, candidates, pinned, None, pin_selected=True,
+                )
                 return pinned
 
         priced = []
+        cost_details = {}
         for engine in candidates:
             breakdown = self.cost_breakdown(engine, node)
+            cost_details[engine.name] = breakdown
             if breakdown["evaluated"]:
                 priced.append((engine, breakdown["total_estimated_cycles"]))
         if not priced:
+            self._record_explanation(
+                node,
+                candidates,
+                None,
+                None,
+                pin_selected=False,
+                cost_details=cost_details,
+            )
             return None
 
         best, best_cost = min(priced, key=lambda item: item[1])
         self.decisions.append((node.name, node.op, best.name, best_cost))
+        self._record_explanation(
+            node,
+            candidates,
+            best,
+            best_cost,
+            pin_selected=False,
+            cost_details=cost_details,
+        )
         return best
 
 
@@ -366,5 +529,7 @@ def make_mapper(pin: Optional[str] = None, host: str = "cva6"):
 
         def __init__(self, engineDict):
             super().__init__(engineDict, pin = pin, host = host)
+            _Mapper.last_instance = self
 
+    _Mapper.last_instance = None
     return _Mapper

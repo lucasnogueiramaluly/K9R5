@@ -35,9 +35,11 @@ def build_catalog() -> list[dict]:
             **asdict(meta),
             "implementation_source": "pipeline/hetero_platform/mapper.py",
             "integration_source": "pipeline/hetero_platform/generate.py",
-            # Current upstream has no per-node mapping explanation yet. Do not
-            # claim Lucas's later evidence surface is operational here.
-            "decision_explanation": {"available": False, "path": None},
+            "decision_explanation": {
+                "available": True,
+                "path": "mapping.nodes[].mapping_explanation",
+                "evidence": "descriptive_shadow_of_mapper_decision",
+            },
         }
         for strategy_id, meta in sorted(META.items())
     ]

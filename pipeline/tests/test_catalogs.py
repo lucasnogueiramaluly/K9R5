@@ -56,11 +56,15 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "metadata drift"):
             build_host_catalog({"cva6": "hetero_soc", "ara": "hetero_ara", "future": "x"})
 
-    def test_mapping_catalog_points_to_current_mapper_without_claiming_explanations(self):
+    def test_mapping_catalog_points_to_current_mapper_and_generated_explanations(self):
         rows = build_mapping_catalog()
         self.assertEqual([row["id"] for row in rows], ["measured_rate_greedy"])
         self.assertNotIn("pin", MAPPING_META)
-        self.assertEqual(rows[0]["decision_explanation"], {"available": False, "path": None})
+        self.assertEqual(rows[0]["decision_explanation"], {
+            "available": True,
+            "path": "mapping.nodes[].mapping_explanation",
+            "evidence": "descriptive_shadow_of_mapper_decision",
+        })
 
         mapper = ast.parse((ROOT / "pipeline" / "hetero_platform" / "mapper.py").read_text())
         classes = {node.name for node in mapper.body if isinstance(node, ast.ClassDef)}
