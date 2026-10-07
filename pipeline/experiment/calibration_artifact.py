@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Identity, provenance, and validation for M4IA calibration artifacts.
 
-This module is deliberately not wired into the sweep runner.  It describes
-the inputs of a calibration and the sidecar contract that a later integration
-checkpoint can use when producing or reusing ``rates.json``.
+The sweep runner uses this module to decide whether ``rates.json`` is reusable
+and to write its validated sidecar only after successful calibration.
 """
 
 from __future__ import annotations
@@ -325,7 +324,18 @@ def cache_status(
         return False, "schema-mismatch"
     if metadata.get("kind") != KIND:
         return False, "kind-mismatch"
-    if metadata.get("input_fingerprint") != input_fingerprint:
+    if metadata.get("protocol") != PROTOCOL_ID:
+        return False, "protocol-mismatch"
+
+    input_identity = metadata.get("input_identity")
+    if not isinstance(input_identity, dict):
+        return False, "input-identity-invalid"
+    stored_fingerprint = metadata.get("input_fingerprint")
+    if not isinstance(stored_fingerprint, str) or (
+        fingerprint(input_identity) != stored_fingerprint
+    ):
+        return False, "input-identity-mismatch"
+    if stored_fingerprint != input_fingerprint:
         return False, "input-mismatch"
 
     artifacts = metadata.get("artifacts")

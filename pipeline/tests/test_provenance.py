@@ -10,9 +10,11 @@ sys.path.insert(0, str(ROOT))
 from pipeline.experiment.fingerprint import fingerprint  # noqa: E402
 from pipeline.experiment.provenance import (  # noqa: E402
     SOURCE_SUFFIXES,
+    capture_run_provenance,
     git_snapshot,
     git_snapshot_optional,
     patch_digests,
+    run_source_files,
     semantic_git_identity,
     source_files_under,
     toolchain_snapshot,
@@ -20,6 +22,14 @@ from pipeline.experiment.provenance import (  # noqa: E402
 
 
 class ProvenanceTests(unittest.TestCase):
+    @staticmethod
+    def resolved(*, target="hetero_soc", memory="fixed", application=None):
+        return {
+            "simulator": {"target": target},
+            "memory": {"kind": memory},
+            "workload": {"application": application},
+        }
+
     def _git(self, root, *args):
         return subprocess.run(
             ["git", "-C", str(root), *args],
@@ -109,6 +119,112 @@ class ProvenanceTests(unittest.TestCase):
             self.assertEqual(snapshot["executable"], "compiler")
             self.assertEqual(snapshot["version"], "fixture compiler 1.0")
             self.assertTrue(snapshot["binary_digest"].startswith("sha256:"))
+
+    def test_run_source_set_covers_execution_and_excludes_noncausal_files(self):
+        relative = {
+            path.relative_to(ROOT).as_posix()
+            for path in run_source_files(
+                ROOT, self.resolved(), include_sweep=True,
+            )
+        }
+        for path in (
+            "pipeline/run_hetero.py",
+            "pipeline/hetero_platform/mapper.py",
+            "pipeline/hetero_platform/generate.py",
+            "pipeline/sweep/run.py",
+            "runtime/mesh/hes_host.c",
+            "targets/hetero_soc.py",
+        ):
+            self.assertIn(path, relative)
+        for path in (
+            "runtime/mesh/hes_system.h",
+            "runtime/mesh/host.ld",
+            "runtime/mesh/snitch.ld",
+            "runtime/mesh/spatz.ld",
+            "runtime/mesh/memsys_expect.h",
+            "targets/hetero_ara.py",
+            "targets/hetero/dram.cpp",
+            "targets/hetero/dram.py",
+            "targets/hetero/dram_core.hpp",
+        ):
+            self.assertNotIn(path, relative)
+        self.assertNotIn("pipeline/sweep/area.py", relative)
+        self.assertNotIn("README.md", relative)
+        self.assertFalse(any(path.startswith("docs/") for path in relative))
+        self.assertFalse(any(path.startswith("gui/") for path in relative))
+        self.assertFalse(any(path.startswith("results/") for path in relative))
+        self.assertFalse(any(path.startswith("work/") for path in relative))
+
+    def _run_fixture(self, root):
+        paths = {
+            "pipeline/run_hetero.py": "runner\n",
+            "targets/hetero_soc.py": "cva6 adapter\n",
+            "targets/hetero_ara.py": "ara adapter\n",
+            "targets/hetero/dram.cpp": "real dram\n",
+            "runtime/mesh/hes_system.h": "generated default\n",
+            "README.md": "docs\n",
+        }
+        for relative, content in paths.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+
+    def _run_digest(self, root, *, target="hetero_soc", memory="fixed"):
+        return capture_run_provenance(
+            root, self.resolved(target=target, memory=memory),
+        )["source_set"]["digest"]
+
+    def test_run_source_digest_changes_for_causal_source_not_readme(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._run_fixture(root)
+            runner = root / "pipeline" / "run_hetero.py"
+            readme = root / "README.md"
+            first = self._run_digest(root)
+            readme.write_text("second docs\n")
+            second = self._run_digest(root)
+            runner.write_text("second\n")
+            third = self._run_digest(root)
+        self.assertEqual(first, second)
+        self.assertNotEqual(second, third)
+
+    def test_generated_mesh_defaults_do_not_change_run_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._run_fixture(root)
+            first = self._run_digest(root)
+            (root / "runtime/mesh/hes_system.h").write_text("stale other default\n")
+            second = self._run_digest(root)
+        self.assertEqual(first, second)
+
+    def test_real_dram_sources_are_memory_conditional(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._run_fixture(root)
+            fixed_before = self._run_digest(root, memory="fixed")
+            real_before = self._run_digest(root, memory="lpddr5")
+            (root / "targets/hetero/dram.cpp").write_text("changed real dram\n")
+            fixed_after = self._run_digest(root, memory="fixed")
+            real_after = self._run_digest(root, memory="lpddr5")
+        self.assertEqual(fixed_before, fixed_after)
+        self.assertNotEqual(real_before, real_after)
+
+    def test_unselected_host_adapter_does_not_change_run_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._run_fixture(root)
+            cva6_before = self._run_digest(root, target="hetero_soc")
+            ara_before = self._run_digest(root, target="hetero_ara")
+            (root / "targets/hetero_ara.py").write_text("changed ara adapter\n")
+            cva6_after = self._run_digest(root, target="hetero_soc")
+            ara_after = self._run_digest(root, target="hetero_ara")
+            (root / "targets/hetero_soc.py").write_text("changed cva6 adapter\n")
+            cva6_final = self._run_digest(root, target="hetero_soc")
+            ara_final = self._run_digest(root, target="hetero_ara")
+        self.assertEqual(cva6_before, cva6_after)
+        self.assertNotEqual(ara_before, ara_after)
+        self.assertNotEqual(cva6_after, cva6_final)
+        self.assertEqual(ara_after, ara_final)
 
 
 if __name__ == "__main__":

@@ -102,6 +102,28 @@ class CalibrationArtifactTests(unittest.TestCase):
         ))
         self.assertNotEqual(baseline["input_fingerprint"], changed["input_fingerprint"])
 
+    def test_causal_calibration_source_change_changes_fingerprint(self):
+        baseline = self.context()
+        changed = build_calibration_context(
+            self.resolved(),
+            source_set_digest="sha256:changed-calibration-sources",
+            dependencies={
+                "deeploy": self.dependency("deeploy"),
+                "gvsoc": self.dependency("gvsoc"),
+                "gvsoc_core": self.dependency("gvsoc-core"),
+            },
+            patches=[
+                {"path": "deps/patches/b.patch", "digest": "sha256:patch-b"},
+                {"path": "deps/patches/a.patch", "digest": "sha256:patch-a"},
+            ],
+            toolchain={
+                "version": "gcc fixture 15.2",
+                "binary_digest": "sha256:gcc",
+            },
+            simulator_binary={"binary_digest": "sha256:gvsoc-binary"},
+        )
+        self.assertNotEqual(baseline["input_fingerprint"], changed["input_fingerprint"])
+
     def test_host_and_target_change_changes_fingerprint(self):
         cva6 = self.context(self.resolved(host="cva6"))
         ara = self.context(self.resolved(host="ara"))
@@ -228,7 +250,8 @@ class CalibrationArtifactTests(unittest.TestCase):
             cases = (
                 (dict(original, schema_version=SCHEMA_VERSION + 1), "schema-mismatch"),
                 (dict(original, kind="legacy.calibration"), "kind-mismatch"),
-                (dict(original, input_fingerprint="sha256:other"), "input-mismatch"),
+                (dict(original, input_fingerprint="sha256:other"),
+                 "input-identity-mismatch"),
             )
             for blob, reason in cases:
                 with self.subTest(reason=reason):
@@ -243,6 +266,40 @@ class CalibrationArtifactTests(unittest.TestCase):
             self.assertEqual(
                 cache_status(rates, metadata, context["input_fingerprint"]),
                 (False, "rates-digest-mismatch"),
+            )
+
+    def test_protocol_and_internal_identity_are_validated_before_cache_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rates, log, metadata = self._artifacts(root)
+            context = self.context()
+            write_metadata(metadata, context, rates, log)
+            original = json.loads(metadata.read_text())
+
+            cases = (
+                (dict(original, protocol="legacy_protocol"), "protocol-mismatch"),
+                ({key: value for key, value in original.items()
+                  if key != "input_identity"}, "input-identity-invalid"),
+                (dict(original, input_identity=[]), "input-identity-invalid"),
+                (dict(original, input_identity={"tampered": True}),
+                 "input-identity-mismatch"),
+            )
+            for blob, reason in cases:
+                with self.subTest(reason=reason):
+                    metadata.write_text(json.dumps(blob))
+                    self.assertEqual(
+                        cache_status(rates, metadata, context["input_fingerprint"]),
+                        (False, reason),
+                    )
+
+            metadata.write_text(json.dumps(original))
+            self.assertEqual(
+                cache_status(rates, metadata, "sha256:different-expected-input"),
+                (False, "input-mismatch"),
+            )
+            self.assertEqual(
+                cache_status(rates, metadata, context["input_fingerprint"]),
+                (True, "hit"),
             )
 
     def test_metadata_records_identity_provenance_and_artifact_digests(self):

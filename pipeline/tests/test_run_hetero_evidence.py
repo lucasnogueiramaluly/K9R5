@@ -137,6 +137,43 @@ class RunHeteroEvidenceTests(unittest.TestCase):
         self.assertEqual(payload["mapping"], mapping)
         self.assertEqual(payload["result"], result)
 
+    def test_production_result_classifies_every_offload_failure_as_wrong_result(self):
+        lines = (
+            "[HES] core=cva6 cycles=10 instret=9 errors=0 total=1 "
+            "maxdiff_e6=0 offload_failures=1\n",
+            "[HES-MNIST] images=1 correct=1 agree_with_onnx=1 "
+            "cycles_total=10 cycles_per_image=10 offload_failures=1\n",
+            "[HES-KWS] clips=1 correct=1 agree_with_onnx=1 mfcc_maxdiff_e6=0 "
+            "cycles_total=10 cycles_per_clip=10 frontend_engine=1 "
+            "frontend_busy=5 frontend_wait=0 hidden=2 snitch_busy=5 "
+            "spatz_busy=5 pipelined=1 offload_failures=1\n",
+        )
+
+        class Process:
+            def __init__(self, line):
+                self.stdout = iter((line,))
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                return None
+
+            def wait(self):
+                return 0
+
+        for line in lines:
+            with self.subTest(prefix=line.split("]", 1)[0]), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(
+                        run_hetero.subprocess, "Popen", return_value=Process(line),
+                    ):
+                result = run_hetero.simulate(
+                    {"host": "host", "snitch": "snitch", "spatz": "spatz"},
+                    Path(tmp), total_nodes=0, timeout_s=5, stall_s=5, quiet=True,
+                )
+            self.assertGreater(result["offload_failures"], 0)
+            self.assertEqual(result["status"], "wrong-result")
+
 
 if __name__ == "__main__":
     unittest.main()
