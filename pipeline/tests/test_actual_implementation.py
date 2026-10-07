@@ -153,6 +153,28 @@ class ActualImplementationTests(unittest.TestCase):
         self.assertIn("ambiguous", annotated["nodes"][0]["implementation"]["evidence"]["reason"])
         self.assertIn("unavailable", annotated["nodes"][1]["implementation"]["evidence"]["reason"])
 
+    def test_partial_stalled_result_annotates_only_completed_nodes_and_keeps_status(self):
+        mapping = {"nodes": [
+            _generated(0, "snitch", M=2, N=3, O=8),
+            _generated(1, "spatz", M=2, N=3, O=8),
+        ]}
+        result = {
+            "status": "stalled",
+            "nodes": [_completed(0, "snitch")],
+            "log_tail": ["still waiting"],
+        }
+        annotated = annotate_completed_nodes(mapping, result)
+        self.assertEqual(annotated["status"], "stalled")
+        self.assertEqual(annotated["log_tail"], ["still waiting"])
+        self.assertEqual(len(annotated["nodes"]), 1)
+        self.assertEqual(annotated["nodes"][0]["node"], 0)
+        self.assertEqual(
+            annotated["nodes"][0]["implementation"]["implementation_id"],
+            SNITCH_TUNED,
+        )
+        self.assertNotIn("implementation", mapping["nodes"][0])
+        self.assertEqual(len(mapping["nodes"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
