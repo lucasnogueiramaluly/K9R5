@@ -45,8 +45,10 @@ Historical context remains intentionally separate: the Portuguese
 [development report](docs/relatorio-desenvolvimento.md), the original
 [heterogeneous-mesh proposal](docs/hetero-mesh-plan.md), the
 [Foundation construction history](docs/dev/foundation-checkpoints.md), and the
-[modern integration notes](docs/dev/integration-notes.md). Future scientific
-work is sequenced in the [research roadmap](docs/dev/research-roadmap.md).
+[modern integration notes](docs/dev/integration-notes.md), which record what
+already existed in M4IA, what the Foundation changed, and why it was ported
+semantically. Future scientific work is sequenced in the
+[research roadmap](docs/dev/research-roadmap.md).
 
 M4IA has two related execution contexts:
 

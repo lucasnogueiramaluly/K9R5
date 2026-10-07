@@ -14,7 +14,7 @@ disagree.
 | Add a workload, knob, memory, kernel, strategy, host, metric, precision, engine, or GUI capability | [Extending M4IA](extending-m4ia.md), with the [extension-seam audit](dev/extension-seams.md) | Practical maintainer guide plus technical rationale |
 | Continue the Rust GUI/backend integration | [GUI integration](gui-integration.md) | Maintainer continuation guide |
 | Understand historical project development and architecture rationale | [Development report](relatorio-desenvolvimento.md) and [heterogeneous-mesh proposal](hetero-mesh-plan.md) | Historical/rationale |
-| Understand how the Foundation was built and ported | [Foundation checkpoints](dev/foundation-checkpoints.md) and [integration notes](dev/integration-notes.md) | Historical construction and maintainer integration record |
+| Understand Foundation construction and what changed from pre-Foundation M4IA | [Foundation checkpoints](dev/foundation-checkpoints.md) for M1–M9, then [integration notes](dev/integration-notes.md#before-and-after-the-experimental-foundation) for the modern before/after semantic-port record | Historical construction and maintainer integration record |
 | Continue the scientific program | [Research roadmap](dev/research-roadmap.md) | Forward-looking roadmap |
 
 ## Role boundaries
@@ -28,9 +28,10 @@ disagree.
 - **Maintainer guides:** the practical extension and GUI guides explain how to
   continue the system; the seam audit explains why some paths remain fragile
   or blocked.
-- **Historical/rationale:** the development report, mesh proposal, Foundation
-  checkpoints, and integration notes preserve chronology, attribution, and
-  decisions without becoming current operational truth.
+- **Historical/rationale:** the development report and mesh proposal preserve
+  project chronology; Foundation checkpoints preserve M1–M9 construction;
+  integration notes preserve the modern semantic port and the pre/post state.
+  None supersedes current operational source.
 - **Forward-looking roadmap:** the research roadmap sequences future studies;
   it is not evidence that every proposed axis is already causally validated.
 
